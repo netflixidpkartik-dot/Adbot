@@ -209,57 +209,103 @@ BAN_ERRORS = (
     "PeerFlood",
 )
 
+DC_IPS = {
+    1: "149.154.175.53",
+    2: "149.154.167.51",
+    3: "149.154.175.100",
+    4: "149.154.167.91",
+    5: "91.108.56.130"
+}
+
 async def load_session_from_file(file_path):
     """
     Load an authorized session from a .session file.
-    Supports Telethon SQLite session and Pyrogram SQLite session.
+    Supports:
+      1. Telethon SQLite .session files
+      2. Pyrogram SQLite .session files (v1 and v2)
+      3. Plain text string session files
     Returns (session_string, user_entity) or (None, None).
     """
-    # Try 1: Direct Telethon load
+    # ── Method 1: Universal SQLite parser (Telethon + Pyrogram) ─────────────
+    try:
+        conn = sqlite3.connect(file_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM sessions LIMIT 1")
+        row = cur.fetchone()
+        conn.close()
+
+        if row:
+            row_keys = row.keys()
+            dc_id = int(row['dc_id'])
+            
+            # Extract auth_key (BLOB)
+            auth_key = row['auth_key']
+            if isinstance(auth_key, memoryview):
+                auth_key = bytes(auth_key)
+            elif not isinstance(auth_key, bytes):
+                auth_key = bytes(auth_key)
+
+            # Determine server IP and port
+            if 'server_address' in row_keys and row['server_address']:
+                server_ip = str(row['server_address'])
+            else:
+                server_ip = DC_IPS.get(dc_id, "149.154.167.51")
+
+            port = int(row['port']) if ('port' in row_keys and row['port']) else 443
+
+            ip_bytes = ipaddress.ip_address(server_ip).packed
+            if len(ip_bytes) == 4:
+                session_bytes = struct.pack('>B4sH', dc_id, ip_bytes, port) + auth_key
+            else:
+                session_bytes = struct.pack('>B16sH', dc_id, ip_bytes, port) + auth_key
+
+            session_str = '1' + base64.urlsafe_b64encode(session_bytes).decode('ascii')
+
+            tg = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
+            await tg.connect()
+            if await tg.is_user_authorized():
+                me = await tg.get_me()
+                saved_str = tg.session.save()
+                await tg.disconnect()
+                logger.info(f"Successfully loaded session for {getattr(me, 'phone', me.id)} via SQLite parser")
+                return saved_str, me
+            await tg.disconnect()
+            logger.warning("Session extracted from SQLite but is_user_authorized returned False (account logged out/banned)")
+    except Exception as e:
+        logger.warning(f"Universal SQLite session extraction failed: {e}")
+
+    # ── Method 2: Direct Telethon SQLite load fallback ───────────────────────
     try:
         session_base = file_path[:-8] if file_path.endswith('.session') else file_path
         tg = TelegramClient(session_base, config.API_ID, config.API_HASH)
         await tg.connect()
         if await tg.is_user_authorized():
             me = await tg.get_me()
-            session_str = StringSession.save(tg.session)
+            ss = StringSession()
+            ss._dc_id = tg.session.dc_id
+            ss._server_address = tg.session.server_address
+            ss._port = tg.session.port
+            ss._auth_key = tg.session.auth_key
+            saved_str = ss.save()
             await tg.disconnect()
-            return session_str, me
+            logger.info(f"Successfully loaded session for {getattr(me, 'phone', me.id)} via Telethon fallback")
+            return saved_str, me
         await tg.disconnect()
     except Exception as e:
-        logger.warning(f"Telethon direct session file load attempt failed: {e}")
+        logger.warning(f"Telethon direct session file fallback failed: {e}")
 
-    # Try 2: Pyrogram SQLite session conversion to Telethon StringSession
+    # ── Method 3: Text / StringSession in file fallback ──────────────────────
     try:
-        conn = sqlite3.connect(file_path)
-        cur = conn.cursor()
-        cur.execute("SELECT dc_id, auth_key FROM sessions LIMIT 1")
-        row = cur.fetchone()
-        conn.close()
-        if row and row[1]:
-            dc_id, auth_key = row[0], row[1]
-            DC_IPS = {
-                1: "149.154.175.53",
-                2: "149.154.167.51",
-                3: "149.154.175.100",
-                4: "149.154.167.91",
-                5: "91.108.56.130"
-            }
-            server_ip = DC_IPS.get(dc_id, "149.154.167.51")
-            ip = ipaddress.ip_address(server_ip).packed
-            session_bytes = struct.pack('>B4sH', dc_id, ip, 443) + auth_key
-            from telethon.sessions.string import CURRENT_VERSION
-            session_str = CURRENT_VERSION + base64.urlsafe_b64encode(session_bytes).decode('ascii')
-            tg = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
-            await tg.connect()
-            if await tg.is_user_authorized():
-                me = await tg.get_me()
-                saved_str = StringSession.save(tg.session)
-                await tg.disconnect()
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read().strip()
+        if content and len(content) > 50:
+            saved_str, me = await load_session_from_string(content)
+            if saved_str and me:
+                logger.info(f"Successfully loaded session for {getattr(me, 'phone', me.id)} via text file fallback")
                 return saved_str, me
-            await tg.disconnect()
     except Exception as e:
-        logger.warning(f"Pyrogram session conversion attempt failed: {e}")
+        logger.warning(f"Text file session load fallback failed: {e}")
 
     return None, None
 
@@ -271,13 +317,14 @@ async def load_session_from_string(session_str):
     Returns (session_string, user_entity) or (None, None).
     """
     raw_str = session_str.strip()
+    
     # Try 1: Telethon StringSession
     try:
         tg = TelegramClient(StringSession(raw_str), config.API_ID, config.API_HASH)
         await tg.connect()
         if await tg.is_user_authorized():
             me = await tg.get_me()
-            saved_str = StringSession.save(tg.session)
+            saved_str = tg.session.save()
             await tg.disconnect()
             return saved_str, me
         await tg.disconnect()
@@ -293,23 +340,19 @@ async def load_session_from_string(session_str):
         dc_id = pyro_client.storage.dc_id
         await pyro_client.stop()
         
-        DC_IPS = {
-            1: "149.154.175.53",
-            2: "149.154.167.51",
-            3: "149.154.175.100",
-            4: "149.154.167.91",
-            5: "91.108.56.130"
-        }
         server_ip = DC_IPS.get(dc_id, "149.154.167.51")
         ip = ipaddress.ip_address(server_ip).packed
-        session_bytes = struct.pack('>B4sH', dc_id, ip, 443) + auth_key
-        from telethon.sessions.string import CURRENT_VERSION
-        telethon_str = CURRENT_VERSION + base64.urlsafe_b64encode(session_bytes).decode('ascii')
+        if len(ip) == 4:
+            session_bytes = struct.pack('>B4sH', dc_id, ip, 443) + auth_key
+        else:
+            session_bytes = struct.pack('>B16sH', dc_id, ip, 443) + auth_key
+
+        telethon_str = '1' + base64.urlsafe_b64encode(session_bytes).decode('ascii')
         tg = TelegramClient(StringSession(telethon_str), config.API_ID, config.API_HASH)
         await tg.connect()
         if await tg.is_user_authorized():
             me = await tg.get_me()
-            saved_str = StringSession.save(tg.session)
+            saved_str = tg.session.save()
             await tg.disconnect()
             return saved_str, me
         await tg.disconnect()
