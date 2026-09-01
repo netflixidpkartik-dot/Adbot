@@ -41,6 +41,8 @@ import sqlite3
 import base64
 import struct
 import ipaddress
+import zipfile
+import shutil
 import logging
 from cryptography.fernet import Fernet
 
@@ -2686,8 +2688,9 @@ async def handle_document_message(client, m):
     file_name = doc.file_name or "account.session"
     state = db.get_user_state(uid)
     is_session_file = file_name.lower().endswith(".session")
+    is_zip_file = file_name.lower().endswith(".zip")
     
-    if state != "telethon_wait_file" and not is_session_file:
+    if state != "telethon_wait_file" and not (is_session_file or is_zip_file):
         return
         
     accounts_count = db.get_user_accounts_count(uid)
@@ -2702,13 +2705,99 @@ async def handle_document_message(client, m):
         await m.reply(f"<blockquote><b>❌ Account Limit Reached!</b></blockquote>\n\nYou already have <code>{accounts_count}/{limit}</code> accounts hosted.", parse_mode=ParseMode.HTML)
         return
 
-    status_msg = await m.reply("<blockquote><b>⏳ Downloading & verifying .session file...</b></blockquote>", parse_mode=ParseMode.HTML)
+    status_msg = await m.reply("<blockquote><b>⏳ Downloading & processing file...</b></blockquote>", parse_mode=ParseMode.HTML)
     
     os.makedirs("sessions/temp", exist_ok=True)
     temp_path = f"sessions/temp/{uid}_{int(time.time())}_{file_name}"
     
     try:
         downloaded = await client.download_media(m.document, file_name=temp_path)
+        
+        # ── Check if ZIP archive ─────────────────────────────────────────────
+        if is_zip_file:
+            extract_dir = f"sessions/temp/{uid}_{int(time.time())}_extracted"
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(downloaded, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+            
+            # Find all .session files
+            session_files = []
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    if f.lower().endswith(".session"):
+                        session_files.append(os.path.join(root, f))
+            
+            if not session_files:
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                if os.path.exists(downloaded):
+                    try: os.remove(downloaded)
+                    except Exception: pass
+                await status_msg.edit_text(
+                    "<blockquote><b>❌ No .session files found inside the ZIP!</b></blockquote>\n\n"
+                    "Please make sure your ZIP archive contains <code>.session</code> file(s).",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+                )
+                return
+
+            added_count = 0
+            failed_count = 0
+            added_phones = []
+
+            for s_file in session_files:
+                session_str, me = await load_session_from_file(s_file)
+                if session_str and me:
+                    phone = getattr(me, 'phone', None) or f"+{me.id}"
+                    first_name = getattr(me, 'first_name', '') or ''
+                    last_name = getattr(me, 'last_name', '') or ''
+                    session_encrypted = cipher_suite.encrypt(session_str.encode()).decode()
+                    db.add_user_account(
+                        uid,
+                        phone,
+                        session_encrypted,
+                        first_name=first_name,
+                        last_name=last_name
+                    )
+                    added_count += 1
+                    added_phones.append(f"<code>{phone}</code> ({first_name})")
+                    await send_dm_log(uid, f"<b>📁 Account added from ZIP:</b> <code>{phone}</code> ({first_name}) ✅")
+                else:
+                    failed_count += 1
+
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            if os.path.exists(downloaded):
+                try: os.remove(downloaded)
+                except Exception: pass
+
+            db.set_user_state(uid, "")
+            
+            if added_count > 0:
+                phones_list = "\n".join(f"• {p}" for p in added_phones[:10])
+                if len(added_phones) > 10:
+                    phones_list += f"\n...and {len(added_phones) - 10} more"
+                
+                await status_msg.edit_text(
+                    f"<blockquote><b>ZIP Archive Processed! ✅</b></blockquote>\n\n"
+                    f"• <b>Added Successfully:</b> <code>{added_count}</code> account(s)\n"
+                    f"• <b>Failed / Invalid:</b> <code>{failed_count}</code>\n\n"
+                    f"<b>Accounts Added:</b>\n{phones_list}\n\n"
+                    "╰_╯All accounts are ready for auto broadcasting!",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb([
+                        [InlineKeyboardButton("Add More ➕", callback_data="host_account")],
+                        [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+                    ])
+                )
+            else:
+                await status_msg.edit_text(
+                    "<blockquote><b>❌ Failed to load any valid accounts from ZIP!</b></blockquote>\n\n"
+                    "Please check your session files and try again.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+                )
+            return
+
+        # ── Single .session file handling ────────────────────────────────────
         session_str, me = await load_session_from_file(downloaded)
         
         # Clean up temporary downloaded file
@@ -2760,12 +2849,12 @@ async def handle_document_message(client, m):
         await send_dm_log(uid, f"<b>📁 Account added via .session file:</b> <code>{phone}</code> ({first_name}) ✅")
         logger.info(f"Account added via session file for user {uid}: {phone}")
     except Exception as e:
-        logger.error(f"Error handling session file for user {uid}: {e}")
+        logger.error(f"Error handling document for user {uid}: {e}")
         if os.path.exists(temp_path):
             try: os.remove(temp_path)
             except Exception: pass
         await status_msg.edit_text(
-            f"<blockquote><b>❌ Error handling session file:</b></blockquote>\n\n<code>{str(e)}</code>",
+            f"<blockquote><b>❌ Error handling file:</b></blockquote>\n\n<code>{str(e)}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
         )
