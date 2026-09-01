@@ -36,6 +36,11 @@ from pyrogram.enums import ParseMode, ChatType
 import config
 from database import EnhancedDatabaseManager
 import os
+import time
+import sqlite3
+import base64
+import struct
+import ipaddress
 import logging
 from cryptography.fernet import Fernet
 
@@ -203,6 +208,116 @@ BAN_ERRORS = (
     "SpamBot",
     "PeerFlood",
 )
+
+async def load_session_from_file(file_path):
+    """
+    Load an authorized session from a .session file.
+    Supports Telethon SQLite session and Pyrogram SQLite session.
+    Returns (session_string, user_entity) or (None, None).
+    """
+    # Try 1: Direct Telethon load
+    try:
+        session_base = file_path[:-8] if file_path.endswith('.session') else file_path
+        tg = TelegramClient(session_base, config.API_ID, config.API_HASH)
+        await tg.connect()
+        if await tg.is_user_authorized():
+            me = await tg.get_me()
+            session_str = StringSession.save(tg.session)
+            await tg.disconnect()
+            return session_str, me
+        await tg.disconnect()
+    except Exception as e:
+        logger.warning(f"Telethon direct session file load attempt failed: {e}")
+
+    # Try 2: Pyrogram SQLite session conversion to Telethon StringSession
+    try:
+        conn = sqlite3.connect(file_path)
+        cur = conn.cursor()
+        cur.execute("SELECT dc_id, auth_key FROM sessions LIMIT 1")
+        row = cur.fetchone()
+        conn.close()
+        if row and row[1]:
+            dc_id, auth_key = row[0], row[1]
+            DC_IPS = {
+                1: "149.154.175.53",
+                2: "149.154.167.51",
+                3: "149.154.175.100",
+                4: "149.154.167.91",
+                5: "91.108.56.130"
+            }
+            server_ip = DC_IPS.get(dc_id, "149.154.167.51")
+            ip = ipaddress.ip_address(server_ip).packed
+            session_bytes = struct.pack('>B4sH', dc_id, ip, 443) + auth_key
+            from telethon.sessions.string import CURRENT_VERSION
+            session_str = CURRENT_VERSION + base64.urlsafe_b64encode(session_bytes).decode('ascii')
+            tg = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
+            await tg.connect()
+            if await tg.is_user_authorized():
+                me = await tg.get_me()
+                saved_str = StringSession.save(tg.session)
+                await tg.disconnect()
+                return saved_str, me
+            await tg.disconnect()
+    except Exception as e:
+        logger.warning(f"Pyrogram session conversion attempt failed: {e}")
+
+    return None, None
+
+
+async def load_session_from_string(session_str):
+    """
+    Load an authorized session from a string session.
+    Supports Telethon StringSession and Pyrogram StringSession.
+    Returns (session_string, user_entity) or (None, None).
+    """
+    raw_str = session_str.strip()
+    # Try 1: Telethon StringSession
+    try:
+        tg = TelegramClient(StringSession(raw_str), config.API_ID, config.API_HASH)
+        await tg.connect()
+        if await tg.is_user_authorized():
+            me = await tg.get_me()
+            saved_str = StringSession.save(tg.session)
+            await tg.disconnect()
+            return saved_str, me
+        await tg.disconnect()
+    except Exception as e:
+        logger.warning(f"Telethon string session attempt failed: {e}")
+
+    # Try 2: Pyrogram StringSession -> convert to Telethon
+    try:
+        pyro_client = PyroClient("temp_auth", api_id=config.API_ID, api_hash=config.API_HASH, session_string=raw_str, in_memory=True)
+        await pyro_client.start()
+        me_pyro = await pyro_client.get_me()
+        auth_key = pyro_client.storage.auth_key.key
+        dc_id = pyro_client.storage.dc_id
+        await pyro_client.stop()
+        
+        DC_IPS = {
+            1: "149.154.175.53",
+            2: "149.154.167.51",
+            3: "149.154.175.100",
+            4: "149.154.167.91",
+            5: "91.108.56.130"
+        }
+        server_ip = DC_IPS.get(dc_id, "149.154.167.51")
+        ip = ipaddress.ip_address(server_ip).packed
+        session_bytes = struct.pack('>B4sH', dc_id, ip, 443) + auth_key
+        from telethon.sessions.string import CURRENT_VERSION
+        telethon_str = CURRENT_VERSION + base64.urlsafe_b64encode(session_bytes).decode('ascii')
+        tg = TelegramClient(StringSession(telethon_str), config.API_ID, config.API_HASH)
+        await tg.connect()
+        if await tg.is_user_authorized():
+            me = await tg.get_me()
+            saved_str = StringSession.save(tg.session)
+            await tg.disconnect()
+            return saved_str, me
+        await tg.disconnect()
+    except Exception as e:
+        logger.warning(f"Pyrogram string session conversion failed: {e}")
+
+    return None, None
+
 
 # Invisible Unicode chars to vary message fingerprint so each send is unique
 INVISIBLE_CHARS = ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"]
@@ -922,7 +1037,7 @@ async def menu_main(client, cb):
         logger.error(f"Error in menu_main for user {uid}: {e}")
         await cb.answer("Error loading dashboard. Try /start.", show_alert=True)
 
-@pyro.on_callback_query(filters.regex("host_account"))
+@pyro.on_callback_query(filters.regex(r"^host_account$"))
 async def host_account(client, cb):
     uid = cb.from_user.id
     user = db.get_user(uid)
@@ -932,27 +1047,152 @@ async def host_account(client, cb):
         return
     
     accounts_count = db.get_user_accounts_count(uid)
+    limit = user.get("accounts_limit", 5)
+    if isinstance(limit, str):
+        if limit.lower() == "unlimited":
+            limit = 999
+        else:
+            try:
+                limit = int(limit)
+            except (TypeError, ValueError):
+                limit = 5
     
+    if not is_owner(uid) and accounts_count >= limit:
+        await cb.answer(f"Account limit reached ({accounts_count}/{limit}).", show_alert=True)
+        return
+    
+    menu = [
+        [InlineKeyboardButton("📱 Via Phone Number + OTP", callback_data="host_by_phone")],
+        [InlineKeyboardButton("📁 Via .session File (Direct)", callback_data="host_by_file")],
+        [InlineKeyboardButton("🔑 Via String Session", callback_data="host_by_string")],
+        [InlineKeyboardButton("Back 🔙", callback_data="menu_main")]
+    ]
+    
+    caption = (
+        "<blockquote><b>╰_╯ HOST NEW TELEGRAM ACCOUNT</b></blockquote>\n\n"
+        "Choose your preferred login method:\n\n"
+        "• 📱 <b>Phone + OTP:</b> Login with phone number and receive OTP code\n"
+        "• 📁 <b>.session File:</b> Upload a Telethon or Pyrogram <code>.session</code> file directly\n"
+        "• 🔑 <b>String Session:</b> Paste your session string\n\n"
+        f"<b>Hosted Accounts:</b> <code>{accounts_count}</code>\n"
+        "<blockquote>All sessions are AES-256 encrypted and secure 🔒</blockquote>"
+    )
+    
+    try:
+        await cb.message.edit_media(
+            media=InputMediaPhoto(
+                media=config.FORCE_JOIN_IMAGE,
+                caption=caption,
+                parse_mode=ParseMode.HTML
+            ),
+            reply_markup=kb(menu)
+        )
+    except Exception:
+        await cb.message.edit_caption(
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb(menu)
+        )
+
+@pyro.on_callback_query(filters.regex(r"^host_by_phone$"))
+async def host_by_phone(client, cb):
+    uid = cb.from_user.id
     try:
         db.set_user_state(uid, "telethon_wait_phone")
         db.set_temp_data(uid, None)
     except Exception as e:
         logger.error(f"Failed to set user state for {uid}: {e}")
-        await cb.answer("Error initiating account hosting. Try again.", show_alert=True)
+        await cb.answer("Error. Try again.", show_alert=True)
         return
-    
-    await cb.message.edit_media(
-        media=InputMediaPhoto(
-            media=config.FORCE_JOIN_IMAGE,
-            caption="""<blockquote><b>╰_╯HOST NEW ACCOUNT</b></blockquote>\n\n"""
-                    """Secure Account Hosting\n\n"""
-                    """Enter your phone number with country code:\n\n"""
-                    """<blockquote>Example: <code>+1234567890</code></blockquote>\n\n"""
-                    """Your data is encrypted and secure""",
-            parse_mode=ParseMode.HTML
-        ),
-        reply_markup=kb([[InlineKeyboardButton("Back 🔙", callback_data="menu_main")]])
+
+    caption = (
+        "<blockquote><b>📱 HOST VIA PHONE NUMBER</b></blockquote>\n\n"
+        "Enter your Telegram phone number with country code:\n\n"
+        "<blockquote>Example: <code>+1234567890</code></blockquote>\n\n"
+        "You will receive an OTP code in your Telegram app."
     )
+    try:
+        await cb.message.edit_media(
+            media=InputMediaPhoto(
+                media=config.FORCE_JOIN_IMAGE,
+                caption=caption,
+                parse_mode=ParseMode.HTML
+            ),
+            reply_markup=kb([[InlineKeyboardButton("Back 🔙", callback_data="host_account")]])
+        )
+    except Exception:
+        await cb.message.edit_caption(
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([[InlineKeyboardButton("Back 🔙", callback_data="host_account")]])
+        )
+
+@pyro.on_callback_query(filters.regex(r"^host_by_file$"))
+async def host_by_file(client, cb):
+    uid = cb.from_user.id
+    try:
+        db.set_user_state(uid, "telethon_wait_file")
+        db.set_temp_data(uid, None)
+    except Exception as e:
+        logger.error(f"Failed to set user state for {uid}: {e}")
+        await cb.answer("Error. Try again.", show_alert=True)
+        return
+
+    caption = (
+        "<blockquote><b>📁 HOST VIA .SESSION FILE</b></blockquote>\n\n"
+        "Send your <code>.session</code> file as a document in this chat.\n\n"
+        "• Supports Telethon & Pyrogram <code>.session</code> files\n"
+        "• Instant login without OTP / phone code\n"
+        "• You can send files one-by-one\n\n"
+        "<blockquote>Send the file now ⬇️</blockquote>"
+    )
+    try:
+        await cb.message.edit_media(
+            media=InputMediaPhoto(
+                media=config.FORCE_JOIN_IMAGE,
+                caption=caption,
+                parse_mode=ParseMode.HTML
+            ),
+            reply_markup=kb([[InlineKeyboardButton("Back 🔙", callback_data="host_account")]])
+        )
+    except Exception:
+        await cb.message.edit_caption(
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([[InlineKeyboardButton("Back 🔙", callback_data="host_account")]])
+        )
+
+@pyro.on_callback_query(filters.regex(r"^host_by_string$"))
+async def host_by_string(client, cb):
+    uid = cb.from_user.id
+    try:
+        db.set_user_state(uid, "telethon_wait_string")
+        db.set_temp_data(uid, None)
+    except Exception as e:
+        logger.error(f"Failed to set user state for {uid}: {e}")
+        await cb.answer("Error. Try again.", show_alert=True)
+        return
+
+    caption = (
+        "<blockquote><b>🔑 HOST VIA STRING SESSION</b></blockquote>\n\n"
+        "Please paste and send your Telethon / Pyrogram String Session text in this chat.\n\n"
+        "<blockquote>Example: <code>1BQAAAA...</code></blockquote>"
+    )
+    try:
+        await cb.message.edit_media(
+            media=InputMediaPhoto(
+                media=config.FORCE_JOIN_IMAGE,
+                caption=caption,
+                parse_mode=ParseMode.HTML
+            ),
+            reply_markup=kb([[InlineKeyboardButton("Back 🔙", callback_data="host_account")]])
+        )
+    except Exception:
+        await cb.message.edit_caption(
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([[InlineKeyboardButton("Back 🔙", callback_data="host_account")]])
+        )
 
 @pyro.on_callback_query(filters.regex("view_accounts"))
 async def view_accounts(client, cb):
@@ -2092,6 +2332,8 @@ async def handle_text_message(client, m):
         await _handle_telethon_phone(uid, text, m)
     elif state == "telethon_wait_password":
         await _handle_telethon_password(uid, text, m)
+    elif state == "telethon_wait_string":
+        await _handle_telethon_string(uid, text, m)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2323,6 +2565,167 @@ async def _handle_telethon_password(uid, text, m):
     finally:
         await tg.disconnect()
 
+
+async def _handle_telethon_string(uid, text, m):
+    """Handle telethon_wait_string state."""
+    user = db.get_user(uid)
+    accounts_count = db.get_user_accounts_count(uid)
+    limit = user.get("accounts_limit", 5) if user else 5
+    if isinstance(limit, str) and limit.lower() == "unlimited":
+        limit = 999
+    else:
+        try: limit = int(limit)
+        except Exception: limit = 5
+
+    if not is_owner(uid) and accounts_count >= limit:
+        await m.reply(f"<blockquote><b>❌ Account Limit Reached!</b></blockquote>\n\nYou already have <code>{accounts_count}/{limit}</code> accounts hosted.", parse_mode=ParseMode.HTML)
+        return
+
+    status_msg = await m.reply("<blockquote><b>⏳ Verifying String Session...</b></blockquote>", parse_mode=ParseMode.HTML)
+    try:
+        session_str, me = await load_session_from_string(text)
+        if not session_str or not me:
+            await status_msg.edit_text(
+                "<blockquote><b>❌ Invalid or Expired String Session!</b></blockquote>\n\nPlease check your session string and try again.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb([[InlineKeyboardButton("Try Again 🔄", callback_data="host_by_string"),
+                                 InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+            )
+            return
+
+        phone = getattr(me, 'phone', None) or f"+{me.id}"
+        first_name = getattr(me, 'first_name', '') or ''
+        last_name = getattr(me, 'last_name', '') or ''
+        username_display = f"@{me.username}" if getattr(me, 'username', None) else "None"
+
+        session_encrypted = cipher_suite.encrypt(session_str.encode()).decode()
+        db.add_user_account(
+            uid,
+            phone,
+            session_encrypted,
+            first_name=first_name,
+            last_name=last_name
+        )
+        db.set_user_state(uid, "")
+
+        await status_msg.edit_text(
+            f"<blockquote><b>Account Successfully Hosted via String Session! ✅</b></blockquote>\n\n"
+            f"• <b>Phone / ID:</b> <code>{phone}</code>\n"
+            f"• <b>Name:</b> {first_name} {last_name}\n"
+            f"• <b>Username:</b> {username_display}\n\n"
+            "╰_╯Your account is ready for auto broadcasting!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([
+                [InlineKeyboardButton("Add Another Account ➕", callback_data="host_account")],
+                [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+            ])
+        )
+        await send_dm_log(uid, f"<b>🔑 Account added via String Session:</b> <code>{phone}</code> ({first_name}) ✅")
+        logger.info(f"Account added via String Session for user {uid}: {phone}")
+    except Exception as e:
+        logger.error(f"Error validating string session for user {uid}: {e}")
+        await status_msg.edit_text(
+            f"<blockquote><b>❌ Error validating session:</b></blockquote>\n\n<code>{str(e)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+        )
+
+
+@pyro.on_message(filters.document & filters.private & ~filters.command(["start", "bd", "me", "stats", "stop"]))
+async def handle_document_message(client, m):
+    uid = m.from_user.id
+    user = db.get_user(uid)
+    if not user:
+        await m.reply("Please /start the bot first.", parse_mode=ParseMode.HTML)
+        return
+
+    doc = m.document
+    file_name = doc.file_name or "account.session"
+    state = db.get_user_state(uid)
+    is_session_file = file_name.lower().endswith(".session")
+    
+    if state != "telethon_wait_file" and not is_session_file:
+        return
+        
+    accounts_count = db.get_user_accounts_count(uid)
+    limit = user.get("accounts_limit", 5)
+    if isinstance(limit, str) and limit.lower() == "unlimited":
+        limit = 999
+    else:
+        try: limit = int(limit)
+        except Exception: limit = 5
+        
+    if not is_owner(uid) and accounts_count >= limit:
+        await m.reply(f"<blockquote><b>❌ Account Limit Reached!</b></blockquote>\n\nYou already have <code>{accounts_count}/{limit}</code> accounts hosted.", parse_mode=ParseMode.HTML)
+        return
+
+    status_msg = await m.reply("<blockquote><b>⏳ Downloading & verifying .session file...</b></blockquote>", parse_mode=ParseMode.HTML)
+    
+    os.makedirs("sessions/temp", exist_ok=True)
+    temp_path = f"sessions/temp/{uid}_{int(time.time())}_{file_name}"
+    
+    try:
+        downloaded = await client.download_media(m.document, file_name=temp_path)
+        session_str, me = await load_session_from_file(downloaded)
+        
+        # Clean up temporary downloaded file
+        if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except Exception: pass
+        if downloaded and os.path.exists(downloaded):
+            try: os.remove(downloaded)
+            except Exception: pass
+            
+        if not session_str or not me:
+            await status_msg.edit_text(
+                "<blockquote><b>❌ Invalid or Expired .session file!</b></blockquote>\n\n"
+                "Could not connect to Telegram with this session file. Please ensure the account is active and not banned.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb([[InlineKeyboardButton("Try Again 🔄", callback_data="host_by_file"),
+                                 InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+            )
+            return
+
+        phone = getattr(me, 'phone', None) or f"+{me.id}"
+        first_name = getattr(me, 'first_name', '') or ''
+        last_name = getattr(me, 'last_name', '') or ''
+        username_display = f"@{me.username}" if getattr(me, 'username', None) else "None"
+
+        session_encrypted = cipher_suite.encrypt(session_str.encode()).decode()
+        
+        db.add_user_account(
+            uid,
+            phone,
+            session_encrypted,
+            first_name=first_name,
+            last_name=last_name
+        )
+        db.set_user_state(uid, "")
+        
+        await status_msg.edit_text(
+            f"<blockquote><b>Account Successfully Hosted via .session File! ✅</b></blockquote>\n\n"
+            f"• <b>Phone / ID:</b> <code>{phone}</code>\n"
+            f"• <b>Name:</b> {first_name} {last_name}\n"
+            f"• <b>Username:</b> {username_display}\n\n"
+            "╰_╯Your account is ready for auto broadcasting!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([
+                [InlineKeyboardButton("Add Another Account ➕", callback_data="host_account")],
+                [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+            ])
+        )
+        await send_dm_log(uid, f"<b>📁 Account added via .session file:</b> <code>{phone}</code> ({first_name}) ✅")
+        logger.info(f"Account added via session file for user {uid}: {phone}")
+    except Exception as e:
+        logger.error(f"Error handling session file for user {uid}: {e}")
+        if os.path.exists(temp_path):
+            try: os.remove(temp_path)
+            except Exception: pass
+        await status_msg.edit_text(
+            f"<blockquote><b>❌ Error handling session file:</b></blockquote>\n\n<code>{str(e)}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+        )
 
 
 async def main():

@@ -1,5 +1,8 @@
 pyrogram
+tgcrypto
 telethon
-pymongo
-cryptography
+pymongo[srv]
 dnspython
+cryptography
+certifi
+python-dotenv

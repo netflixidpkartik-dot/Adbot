@@ -1,0 +1,22 @@
+# Secrets & Keys
+.env
+encryption.key
+
+# Sessions & Database files
+*.session
+*.session-journal
+sessions/
+downloads/
+ads_media/
+
+# Logs
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
