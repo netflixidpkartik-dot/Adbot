@@ -1,4 +1,21 @@
 import asyncio
+import sys
+
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+if hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 import random
 import string
 import re
@@ -6,6 +23,9 @@ import json
 from datetime import datetime, timedelta
 from telethon import TelegramClient, functions, types, events
 from telethon.sessions import StringSession
+from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions import chatlists, channels, messages
+from telethon.tl.types import chatlists as chatlist_types, InputChatlistDialogFilter
 from telethon.tl.types import (
     MessageEntityCustomEmoji,
     MessageEntityBold,
@@ -27,7 +47,11 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     SessionExpiredError,
-    PasswordHashInvalidError
+    PasswordHashInvalidError,
+    AboutTooLongError,
+    ChannelsTooMuchError,
+    InviteHashExpiredError,
+    UserAlreadyParticipantError
 )
 from pyrogram import Client as PyroClient, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -137,7 +161,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/TecxoAds.log'),
+        logging.FileHandler('logs/TecxoAds.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -197,10 +221,8 @@ user_tasks = {}
 # In-memory storage for auto-reply Telethon clients: {owner_uid: {acc_id: tg_client}}
 autoreply_clients = {}
 
-# Errors that mean an account is banned/restricted — stop using it immediately
-BAN_ERRORS = (
-    "UserBannedInChannel",
-    "ChatWriteForbidden",
+# Account-level bans (the entire Telegram account / session is blocked or revoked)
+ACCOUNT_BAN_ERRORS = (
     "UserDeactivated",
     "UserDeactivatedBan",
     "AuthKeyUnregistered",
@@ -210,6 +232,20 @@ BAN_ERRORS = (
     "SpamBot",
     "PeerFlood",
 )
+
+# Group-level restrictions (the group muted the account, write permissions disabled, or admin-only)
+GROUP_RESTRICTED_ERRORS = (
+    "ChatWriteForbidden",
+    "UserBannedInChannel",
+    "ChannelPrivate",
+    "ChatAdminRequired",
+    "RightForbidden",
+    "ChatRestricted",
+    "You cannot write in this chat",
+    "SlowmodeWait",
+)
+
+BAN_ERRORS = ACCOUNT_BAN_ERRORS
 
 DC_IPS = {
     1: "149.154.175.53",
@@ -391,6 +427,21 @@ async def safe_reconnect(tg_client, session_str, phone):
         logger.error(f"Reconnect failed for {phone}: {e}")
         return False
 
+async def safe_leave_group(tg_client, gid):
+    """Safely leave a group or channel via Telethon."""
+    try:
+        await tg_client.delete_dialog(gid)
+        return True
+    except Exception:
+        try:
+            entity = await tg_client.get_input_entity(gid)
+            await tg_client(functions.channels.LeaveChannelRequest(channel=entity))
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to leave group {gid}: {e}")
+            return False
+
+
 async def send_dm_log(user_id, log_message):
     if not db.get_logger_status(user_id):
         logger.info(f"User {user_id} has not started logger bot. Skipping DM log.")
@@ -520,6 +571,47 @@ async def get_channel_ad_message(tg_client):
         return None, None
 
 
+async def send_ad_doc(tg_client, gid, ad_doc):
+    """Send an ad message document to a group entity (supports text, photo, both, forward)."""
+    ad_type = ad_doc.get("ad_type", "text")
+    caption = ad_doc.get("message", "")
+    media = ad_doc.get("photo_path")
+    entities_data = ad_doc.get("entities", [])
+    from_chat = ad_doc.get("from_chat_id")
+    msg_id = ad_doc.get("message_id")
+
+    varied_caption = vary_message(caption or "") if caption else ""
+    tl_entities = pyrogram_entities_to_telethon(entities_data) if entities_data else None
+
+    if ad_type == "forward" and from_chat and msg_id:
+        await tg_client.forward_messages(
+            entity=gid,
+            messages=msg_id,
+            from_peer=from_chat,
+            drop_author=True,
+        )
+    elif media and ad_type in ("photo", "both"):
+        await tg_client.send_file(
+            gid, file=media, caption=varied_caption,
+            formatting_entities=tl_entities
+        )
+    elif caption:
+        await tg_client.send_message(
+            gid, varied_caption,
+            formatting_entities=tl_entities
+        )
+    elif media:
+        await tg_client.send_file(
+            gid, file=media, caption=varied_caption,
+            formatting_entities=tl_entities
+        )
+    else:
+        await tg_client.send_message(
+            gid, varied_caption,
+            formatting_entities=tl_entities
+        )
+
+
 async def run_broadcast(client, uid, account_ids=None):
     """
     Run the broadcast loop.
@@ -529,14 +621,6 @@ async def run_broadcast(client, uid, account_ids=None):
         sent_count = 0
         failed_count = 0
         cycle_count = 0
-
-        db_msgs = db.get_user_ad_messages(uid)
-        fallback_text       = db_msgs[0].get("message") if db_msgs else None
-        fallback_photo      = db_msgs[0].get("photo_path") if db_msgs else None
-        fallback_ad_type    = db_msgs[0].get("ad_type", "text") if db_msgs else "text"
-        fallback_entities   = db_msgs[0].get("entities", []) if db_msgs else []
-        fallback_from_chat  = db_msgs[0].get("from_chat_id") if db_msgs else None
-        fallback_message_id = db_msgs[0].get("message_id") if db_msgs else None
 
         delay = db.get_user_ad_delay(uid)
         all_accounts = db.get_user_accounts(uid)
@@ -618,144 +702,209 @@ async def run_broadcast(client, uid, account_ids=None):
         db.set_broadcast_state(uid, running=True)
 
         # ── Broadcast loop ───────────────────────────────────────────────────
+        # Shared collision & ad-rotation tracker across all concurrent accounts
+        group_last_posted = {}    # {group_id: timestamp}
+        group_last_ad_index = {}  # {group_id: ad_idx} to ensure no group gets the same ad consecutively
+        group_lock = asyncio.Lock()
+        stats_lock = asyncio.Lock()
+        GROUP_COOLDOWN = 90  # 90 seconds (1.5 minutes) minimum between ANY account posting in the same group
+
         try:
             while db.get_broadcast_state(uid).get("running", False):
 
-                # Re-read DB ad settings at start of each cycle (user may have updated them)
-                db_msgs_fresh     = db.get_user_ad_messages(uid)
-                active_ad_type    = db_msgs_fresh[0].get("ad_type", fallback_ad_type)    if db_msgs_fresh else fallback_ad_type
-                active_entities_data = db_msgs_fresh[0].get("entities", fallback_entities) if db_msgs_fresh else fallback_entities
-                active_from_chat  = db_msgs_fresh[0].get("from_chat_id", fallback_from_chat)   if db_msgs_fresh else fallback_from_chat
-                active_message_id = db_msgs_fresh[0].get("message_id",  fallback_message_id)   if db_msgs_fresh else fallback_message_id
+                # Re-read DB ad settings at start of each cycle (user may have added/removed ads)
+                user_ads = db.get_user_ad_messages(uid)
+                ad_mode = db.get_user_ad_mode(uid)
 
-                # Fetch latest ad message/media from channel at the start of every cycle
-                channel_caption, channel_media = None, None
-                for acc_id, (tg_c, _, _ph) in clients.items():
-                    channel_caption, channel_media = await get_channel_ad_message(tg_c)
+                if ad_mode == "single" and user_ads:
+                    user_ads = user_ads[:1]
+
+                # Fallback to ad source channel if user has no saved ads
+                if not user_ads:
+                    channel_caption, channel_media = None, None
+                    for acc_id, (tg_c, _, _ph) in clients.items():
+                        channel_caption, channel_media = await get_channel_ad_message(tg_c)
+                        if channel_caption or channel_media:
+                            break
                     if channel_caption or channel_media:
-                        break
+                        user_ads = [{
+                            "ad_type": "both" if (channel_caption and channel_media) else ("photo" if channel_media else "text"),
+                            "message": channel_caption or "",
+                            "photo_path": channel_media,
+                            "entities": []
+                        }]
 
-                # Determine active content based on ad_type
-                if channel_caption or channel_media:
-                    # Channel content: use as-is (channel messages don't carry entity data here)
-                    active_caption = channel_caption
-                    active_media = channel_media
-                    active_entities_data = []  # channel content has no saved entities
-                else:
-                    # Use user-set DB content filtered by ad_type
-                    if active_ad_type == "text":
-                        active_caption = fallback_text
-                        active_media = None
-                    elif active_ad_type == "photo":
-                        active_caption = ""  # no text
-                        active_media = fallback_photo
-                    else:  # 'both'
-                        active_caption = fallback_text
-                        active_media = fallback_photo
-
-                if active_ad_type != "forward" and not active_caption and not active_media:
-                    await client.send_message(uid, "No ad message or photo found. Please set an ad message/photo first.", parse_mode=ParseMode.HTML)
+                if not user_ads:
+                    await client.send_message(uid, "No ad messages found. Please add at least 1 ad message first in Set Message.", parse_mode=ParseMode.HTML)
                     db.set_broadcast_state(uid, running=False)
                     break
 
-                # Re-shuffle group order every cycle
+                num_ads = len(user_ads)
+
+                # Re-shuffle group order every cycle for each account
                 for acc_id in group_cache:
                     random.shuffle(group_cache[acc_id])
 
+                # ── Worker function for simultaneous account broadcasting ──────
+                async def broadcast_worker(acc_id, tg_client, session_str, phone, start_stagger, acc_index):
+                    nonlocal sent_count, failed_count
+                    try:
+                        if start_stagger > 0:
+                            elapsed_stagger = 0.0
+                            while elapsed_stagger < start_stagger:
+                                if not db.get_broadcast_state(uid).get("running", False):
+                                    return
+                                chunk = min(1.0, start_stagger - elapsed_stagger)
+                                await asyncio.sleep(chunk)
+                                elapsed_stagger += chunk
+
+                        acc_groups = list(group_cache.get(acc_id, []))
+                        random.shuffle(acc_groups)
+                        retry_queue = []
+                        retries_per_group = {}
+
+                        # Base ad index for this account in this cycle:
+                        # Cycle 0: Acc 0 -> Ad 0, Acc 1 -> Ad 1, Acc 2 -> Ad 2...
+                        # Cycle 1: Acc 0 -> Ad 1, Acc 1 -> Ad 2, Acc 2 -> Ad 3...
+                        base_ad_idx = (acc_index + cycle_count) % num_ads
+
+                        while acc_groups or retry_queue:
+                            if not db.get_broadcast_state(uid).get("running", False):
+                                return
+
+                            if not acc_groups:
+                                acc_groups = retry_queue
+                                retry_queue = []
+                                await asyncio.sleep(10)
+                                if not acc_groups:
+                                    break
+
+                            gid, group_name = acc_groups.pop(0)
+
+                            # ── Check anti-spam group cooldown & anti-collision ad ──
+                            should_skip_for_now = False
+                            chosen_ad_idx = base_ad_idx
+                            chosen_ad_doc = None
+
+                            async with group_lock:
+                                last_sent = group_last_posted.get(gid, 0)
+                                if (time.time() - last_sent) < GROUP_COOLDOWN:
+                                    should_skip_for_now = True
+                                else:
+                                    # Anti-collision: never send identical ad consecutively in the same group
+                                    if num_ads > 1:
+                                        last_ad = group_last_ad_index.get(gid)
+                                        if last_ad == chosen_ad_idx:
+                                            chosen_ad_idx = (chosen_ad_idx + 1) % num_ads
+
+                                    chosen_ad_doc = user_ads[chosen_ad_idx]
+                                    group_last_posted[gid] = time.time()
+                                    group_last_ad_index[gid] = chosen_ad_idx
+
+                            if should_skip_for_now:
+                                current_retries = retries_per_group.get(gid, 0)
+                                if current_retries < 3:
+                                    retries_per_group[gid] = current_retries + 1
+                                    retry_queue.append((gid, group_name))
+                                continue
+
+                            # Auto-reconnect if client dropped
+                            if not tg_client.is_connected():
+                                logger.warning(f"Client {phone} disconnected — reconnecting")
+                                reconnected = await safe_reconnect(tg_client, session_str, phone)
+                                if not reconnected:
+                                    banned_accounts.add(acc_id)
+                                    await send_dm_log(uid, f"<b>⚠️ Account {phone} dropped and could not reconnect. Skipping.</b>")
+                                    return
+
+                            try:
+                                await send_ad_doc(tg_client, gid, chosen_ad_doc)
+
+                                async with stats_lock:
+                                    sent_count += 1
+                                    db.increment_broadcast_stats(uid, True)
+                                ad_num_display = chosen_ad_idx + 1
+                                logger.info(f"Sent Ad #{ad_num_display} to {group_name} ({gid}) via {phone}")
+                                await send_dm_log(uid, f"<b>✅ Sent Ad #{ad_num_display} to {group_name}</b> via {phone}")
+
+                            except FloodWaitError as e:
+                                wait = min(e.seconds, 300)
+                                logger.warning(f"FloodWait {e.seconds}s for {phone} in {gid}")
+                                await send_dm_log(uid, f"<b>⚠️ Flood wait {e.seconds}s — {group_name}</b> via {phone}")
+                                async with stats_lock:
+                                    failed_count += 1
+                                    db.increment_broadcast_stats(uid, False)
+                                for _ in range(int(wait)):
+                                    if not db.get_broadcast_state(uid).get("running", False):
+                                        return
+                                    await asyncio.sleep(1)
+
+                            except Exception as e:
+                                err_str = str(e)
+                                logger.error(f"Failed send to {gid} via {phone}: {err_str}")
+                                async with stats_lock:
+                                    failed_count += 1
+                                    db.increment_broadcast_stats(uid, False)
+
+                                # 1. Account-level ban
+                                if any(ban in err_str for ban in ACCOUNT_BAN_ERRORS):
+                                    logger.warning(f"Account {phone} banned/restricted: {err_str}")
+                                    db.deactivate_account(acc_id)
+                                    banned_accounts.add(acc_id)
+                                    await send_dm_log(uid, f"<b>🚫 Account deactivated (banned/restricted):</b> <code>{phone}</code>\n<i>{err_str}</i>")
+                                    return
+
+                                # 2. Group-level restriction (muted, write forbidden, admin only, etc.)
+                                if any(restr.lower() in err_str.lower() for restr in GROUP_RESTRICTED_ERRORS):
+                                    logger.info(f"Group {group_name} ({gid}) is restricted/muted for {phone}. Auto-exiting group...")
+                                    await safe_leave_group(tg_client, gid)
+                                    # Remove from this account's cache
+                                    group_cache[acc_id] = [g for g in group_cache.get(acc_id, []) if g[0] != gid]
+                                    await send_dm_log(
+                                        uid,
+                                        f"<b>🚪 Auto-Left Group:</b> <i>{group_name}</i>\n"
+                                        f"Account <code>{phone}</code> was muted/restricted ({err_str}).\n"
+                                        f"<i>Exited group to protect account health.</i>"
+                                    )
+                                else:
+                                    error_summary.append(f"{group_name}: {err_str}")
+                                    await send_dm_log(uid, f"<b>❌ Failed to send to {group_name}:</b> {err_str}")
+
+                            # Per-account delay between its own sends (45–75 seconds)
+                            per_acc_delay = random.uniform(45, 75)
+                            elapsed_wait = 0.0
+                            while elapsed_wait < per_acc_delay:
+                                if not db.get_broadcast_state(uid).get("running", False):
+                                    return
+                                step = min(1.0, per_acc_delay - elapsed_wait)
+                                await asyncio.sleep(step)
+                                elapsed_wait += step
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as ex:
+                        logger.error(f"Worker exception for {phone}: {ex}")
+
+                # ── Launch all accounts concurrently ───────────────────────────
+                worker_tasks = []
+                stagger_idx = 0
                 for acc in accounts:
-                    if acc['_id'] in banned_accounts:
+                    acc_id = acc['_id']
+                    if acc_id in banned_accounts or acc_id not in clients:
                         continue
+                    tg_client, session_str, phone = clients[acc_id]
+                    stagger = stagger_idx * random.uniform(5, 8)
+                    worker_tasks.append(
+                        asyncio.create_task(
+                            broadcast_worker(acc_id, tg_client, session_str, phone, stagger, stagger_idx)
+                        )
+                    )
+                    stagger_idx += 1
 
-                    entry = clients.get(acc['_id'])
-                    if not entry:
-                        continue
+                if worker_tasks:
+                    await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-                    tg_client, session_str, phone = entry
-                    cached_groups = group_cache.get(acc['_id'], [])
-
-                    for gid, group_name in cached_groups:
-                        if not db.get_broadcast_state(uid).get("running", False):
-                            raise asyncio.CancelledError("Broadcast stopped by user")
-
-                        # Auto-reconnect if client dropped
-                        if not tg_client.is_connected():
-                            logger.warning(f"Client {phone} disconnected — reconnecting")
-                            reconnected = await safe_reconnect(tg_client, session_str, phone)
-                            if not reconnected:
-                                banned_accounts.add(acc['_id'])
-                                await send_dm_log(uid, f"<b>⚠️ Account {phone} dropped and could not reconnect. Skipping.</b>")
-                                break
-
-                        try:
-                            varied_caption = vary_message(active_caption or "")
-                            tl_entities = pyrogram_entities_to_telethon(active_entities_data)
-
-                            # ── Send / Forward ──────────────────────────────────────────────────
-                            if active_ad_type == "forward" and active_from_chat and active_message_id:
-                                # FORWARD MODE: server-side forward — 100% preserves premium emojis
-                                await tg_client.forward_messages(
-                                    entity=gid,
-                                    messages=active_message_id,
-                                    from_peer=active_from_chat,
-                                    drop_author=True,
-                                )
-                            elif active_media and active_ad_type in ("photo", "both"):
-                                await tg_client.send_file(
-                                    gid, file=active_media, caption=varied_caption,
-                                    formatting_entities=tl_entities
-                                )
-                            elif active_caption:
-                                await tg_client.send_message(
-                                    gid, varied_caption,
-                                    formatting_entities=tl_entities
-                                )
-                            elif active_media:
-                                await tg_client.send_file(
-                                    gid, file=active_media, caption=varied_caption,
-                                    formatting_entities=tl_entities
-                                )
-                            else:
-                                await tg_client.send_message(
-                                    gid, varied_caption,
-                                    formatting_entities=tl_entities
-                                )
-
-                                
-                            sent_count += 1
-                            db.increment_broadcast_stats(uid, True)
-                            logger.info(f"Sent ad to {group_name} ({gid}) via {phone}")
-                            await send_dm_log(uid, f"<b>✅ Sent to {group_name}</b> via {phone}")
-
-                        except FloodWaitError as e:
-                            wait = min(e.seconds, 600)
-                            logger.warning(f"FloodWait {e.seconds}s for {phone} in {gid} — waiting {wait}s")
-                            await send_dm_log(uid, f"<b>⚠️ Flood wait {e.seconds}s — {group_name}</b> via {phone}")
-                            await asyncio.sleep(wait)
-                            failed_count += 1
-                            db.increment_broadcast_stats(uid, False)
-
-                        except Exception as e:
-                            err_str = str(e)
-                            logger.error(f"Failed send to {gid} via {phone}: {err_str}")
-
-                            # Detect ban-level errors — deactivate immediately
-                            if any(ban in err_str for ban in BAN_ERRORS):
-                                logger.warning(f"Account {phone} banned/restricted: {err_str}")
-                                db.deactivate_account(acc['_id'])
-                                banned_accounts.add(acc['_id'])
-                                await send_dm_log(uid, f"<b>🚫 Account banned/restricted:</b> <code>{phone}</code>\n<i>{err_str}</i>")
-                                break
-
-                            failed_count += 1
-                            db.increment_broadcast_stats(uid, False)
-                            error_summary.append(f"{group_name}: {err_str}")
-                            await send_dm_log(uid, f"<b>❌ Failed to send to {group_name}:</b> {err_str}")
-
-                        # Safe per-group delay: 45–90 seconds
-                        await asyncio.sleep(random.uniform(45, 90))
-
-                        if not db.get_broadcast_state(uid).get("running", False):
-                            raise asyncio.CancelledError("Broadcast stopped by user")
+                if not db.get_broadcast_state(uid).get("running", False):
+                    break
 
                 cycle_count += 1
                 db.increment_broadcast_cycle(uid)
@@ -767,11 +916,19 @@ async def run_broadcast(client, uid, account_ids=None):
 
                 await send_dm_log(
                     uid,
-                    f"<b>✅ Cycle {cycle_count} done</b> — Sent: {sent_count} | Failed: {failed_count}\n"
-                    f"Next cycle in {delay}s"
+                    f"<b>✅ Cycle {cycle_count} Completed!</b>\n"
+                    f"• Sent: {sent_count:,} | Failed: {failed_count:,}\n"
+                    f"• Next cycle in {delay}s"
                 )
 
-                await asyncio.sleep(delay)
+                # Wait cycle interval (cancellable)
+                elapsed_cycle = 0.0
+                while elapsed_cycle < delay:
+                    if not db.get_broadcast_state(uid).get("running", False):
+                        break
+                    chunk = min(1.0, delay - elapsed_cycle)
+                    await asyncio.sleep(chunk)
+                    elapsed_cycle += chunk
 
                 if not db.get_broadcast_state(uid).get("running", False):
                     raise asyncio.CancelledError("Broadcast stopped by user")
@@ -1016,18 +1173,17 @@ async def menu_main(client, cb):
         
         accounts_count = db.get_user_accounts_count(uid)
         saved_msgs = db.get_user_ad_messages(uid)
+        ad_mode = db.get_user_ad_mode(uid)
         
-        ad_msg_status = "Not Set ⭕"
-        if saved_msgs:
-            msg_doc = saved_msgs[0]
-            has_photo = bool(msg_doc.get("photo_path"))
-            has_text = bool(msg_doc.get("message"))
-            if has_photo and has_text:
-                ad_msg_status = "Set (Photo + Text) 🖼️📝"
-            elif has_photo:
-                ad_msg_status = "Set (Photo Only) 🖼️"
-            elif has_text:
-                ad_msg_status = "Set (Text Only) 📝"
+        ad_count = len(saved_msgs)
+        if ad_count == 0:
+            ad_msg_status = "Not Set ⭕"
+        elif ad_mode == "single" or ad_count == 1:
+            atype = saved_msgs[0].get("ad_type", "text")
+            type_label = {"photo": "Photo 🖼️", "both": "Photo+Text 🖼️📝", "forward": "Forward 📨"}.get(atype, "Text 📝")
+            ad_msg_status = f"1 Ad ({type_label} - Single) ✅"
+        else:
+            ad_msg_status = f"{ad_count} Ads (Rotating) 🔄"
 
         current_delay = db.get_user_ad_delay(uid)
         broadcast_state = db.get_broadcast_state(uid)
@@ -1065,6 +1221,8 @@ async def menu_main(client, cb):
              InlineKeyboardButton("Stop Ads⏸️", callback_data="stop_broadcast")],
             [InlineKeyboardButton(f"Auto Reply {ar_status}", callback_data="auto_reply_menu"),
              InlineKeyboardButton("Analytics", callback_data="analytics")],
+            [InlineKeyboardButton("✏️ Change Bio", callback_data="change_bio_menu"),
+             InlineKeyboardButton("📁 Join Folder", callback_data="join_folder_menu")],
             [InlineKeyboardButton("Delete Accounts", callback_data="delete_accounts")]
         ]
         
@@ -1264,8 +1422,12 @@ async def view_accounts(client, cb):
         ])
     
     caption += "\n<blockquote>╰_╯Choose an action:</blockquote>"
-    buttons.append([InlineKeyboardButton("Add Account", callback_data="host_account")])
-    buttons.append([InlineKeyboardButton("Back", callback_data="menu_main")])
+    buttons.append([InlineKeyboardButton("Add Account ➕", callback_data="host_account")])
+    buttons.append([
+        InlineKeyboardButton("✏️ Change Bio (All)", callback_data="edit_bio_all"),
+        InlineKeyboardButton("📁 Join Folder (All)", callback_data="join_folder_all")
+    ])
+    buttons.append([InlineKeyboardButton("Back 🔙", callback_data="menu_main")])
     
     await cb.message.edit_caption(
         caption=caption,
@@ -1330,124 +1492,922 @@ async def view_account(client, cb):
     uid = cb.from_user.id
     acc_id = cb.data.replace("view_acc_", "")
     accounts = db.get_user_accounts(uid)
-    account = next((acc for acc in accounts if acc['_id'] == acc_id), None)
+    account = next((acc for acc in accounts if str(acc['_id']) == str(acc_id)), None)
     if not account:
-        await cb.answer("╰_╯Custom settings for Accounts is not available in this version, Update will come soon.", show_alert=True)
+        await cb.answer("Account not found.", show_alert=True)
         return
     
-    status = "Active ✅" if account['is_active'] else "Inactive ⭕"
+    status = "Active ✅" if account.get('is_active') else "Inactive ⭕"
+    current_bio = account.get('bio', 'Not set')
     caption = (
         f"<blockquote><b>╰_╯ACCOUNT DETAILS</b></blockquote>\n\n"
-        f"Phone: <code>{account['phone_number']}</code>\n"
-        f"<b>Status:</b>{status}\n\n"
+        f"• <b>Phone:</b> <code>{account['phone_number']}</code>\n"
+        f"• <b>Status:</b> {status}\n"
+        f"• <b>Bio:</b> <code>{current_bio}</code>\n\n"
         f"<blockquote>Choose an action:</blockquote>"
     )
     
     await cb.message.edit_caption(
         caption=caption,
         reply_markup=kb([
-            [InlineKeyboardButton("Delete Account", callback_data=f"delete_acc_{acc_id}")],
-            [InlineKeyboardButton("Back", callback_data="delete_accounts")]
+            [InlineKeyboardButton("✏️ Change Bio", callback_data=f"edit_bio_acc_{acc_id}"),
+             InlineKeyboardButton("📁 Join Folder", callback_data=f"join_folder_acc_{acc_id}")],
+            [InlineKeyboardButton("Delete Account 🗑️", callback_data=f"delete_acc_{acc_id}")],
+            [InlineKeyboardButton("Back 🔙", callback_data="view_accounts")]
         ]),
         parse_mode=ParseMode.HTML
     )
 
-@pyro.on_callback_query(filters.regex("^set_msg$"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MANUAL BIO CHANGE & FOLDER JOIN HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pyro.on_callback_query(filters.regex(r"^change_bio_menu$"))
+async def change_bio_menu(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("Please add accounts first!", show_alert=True)
+        return
+
+    caption = (
+        "<blockquote><b>╰_╯ MANAGE ACCOUNT BIOS ✏️</b></blockquote>\n\n"
+        "You can update the profile <b>Bio (About)</b> of your hosted accounts directly from here.\n\n"
+        "• <b>Bulk update:</b> Change bio for all accounts in one go\n"
+        "• <b>Single account:</b> Change bio for an individual account\n\n"
+        "<i>Standard Telegram bio limit: 70 characters (140 for Premium).</i>\n\n"
+        "<blockquote>Select an option below:</blockquote>"
+    )
+
+    buttons = [
+        [InlineKeyboardButton("🌐 Update Bio for ALL Accounts", callback_data="edit_bio_all")]
+    ]
+    
+    row = []
+    for acc in accounts:
+        phone = acc.get("phone_number", "Acc")
+        acc_id = str(acc["_id"])
+        row.append(InlineKeyboardButton(f"✏️ {phone}", callback_data=f"edit_bio_acc_{acc_id}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton("Back 🔙", callback_data="menu_main")])
+
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.warning(f"Error in change_bio_menu: {e}")
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^edit_bio_all$"))
+async def edit_bio_all_cb(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("No accounts available!", show_alert=True)
+        return
+
+    db.set_user_state(uid, "waiting_bio_all")
+    caption = (
+        f"<blockquote><b>✏️ SET BIO FOR ALL ACCOUNTS</b></blockquote>\n\n"
+        f"Please send the new Bio text below. It will be applied to <b>all {len(accounts)} hosted accounts</b>.\n\n"
+        f"<i>• Max 70 characters (140 for Premium)</i>\n"
+        f"<i>• Send <code>/clear</code> to remove bio</i>\n"
+        f"<i>• Send <code>/cancel</code> to abort</i>"
+    )
+    buttons = [[InlineKeyboardButton("Cancel ❌", callback_data="change_bio_menu")]]
+
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^edit_bio_acc_"))
+async def edit_bio_single_cb(client, cb):
+    uid = cb.from_user.id
+    acc_id = cb.data.replace("edit_bio_acc_", "")
+    accounts = db.get_user_accounts(uid)
+    account = next((a for a in accounts if str(a["_id"]) == str(acc_id)), None)
+    if not account:
+        await cb.answer("Account not found!", show_alert=True)
+        return
+
+    phone = account.get("phone_number", "Unknown")
+    db.set_user_state(uid, "waiting_bio_single")
+    db.set_user_temp_data(uid, "target_bio_acc", {"acc_id": str(acc_id), "phone": phone})
+
+    caption = (
+        f"<blockquote><b>✏️ SET BIO FOR {phone}</b></blockquote>\n\n"
+        f"Please send the new Bio text for this account below:\n\n"
+        f"<i>• Max 70 characters (140 for Premium)</i>\n"
+        f"<i>• Send <code>/clear</code> to remove bio</i>\n"
+        f"<i>• Send <code>/cancel</code> to abort</i>"
+    )
+    buttons = [[InlineKeyboardButton("Cancel ❌", callback_data=f"view_acc_{acc_id}")]]
+
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+async def perform_bio_update(client, uid, new_bio, account_ids=None):
+    new_bio = new_bio.strip()
+    if new_bio.lower() == "/clear":
+        new_bio = ""
+
+    if len(new_bio) > 140:
+        await client.send_message(
+            uid,
+            f"<blockquote><b>❌ Bio too long!</b></blockquote>\n\n"
+            f"Telegram allows max <b>70 characters</b> (140 for Premium).\n"
+            f"Your text has <b>{len(new_bio)} characters</b>.\n\n"
+            f"Please try again with a shorter message.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([[InlineKeyboardButton("Back to Bio Menu", callback_data="change_bio_menu")]])
+        )
+        return
+
+    all_accounts = db.get_user_accounts(uid)
+    if not all_accounts:
+        await client.send_message(uid, "❌ No accounts found.", reply_markup=kb([[InlineKeyboardButton("Dashboard", callback_data="menu_main")]]))
+        return
+
+    if account_ids:
+        targets = [a for a in all_accounts if str(a['_id']) in [str(x) for x in account_ids]]
+    else:
+        targets = [a for a in all_accounts if a.get('is_active', True)]
+
+    if not targets:
+        await client.send_message(uid, "❌ No active accounts to update.", reply_markup=kb([[InlineKeyboardButton("Back", callback_data="change_bio_menu")]]))
+        return
+
+    bio_display = f"<code>{new_bio}</code>" if new_bio else "<i>[Cleared]</i>"
+    status_msg = await client.send_message(
+        uid,
+        f"⏳ <b>Updating Bio across {len(targets)} account(s)...</b>\n\n"
+        f"<b>Target Bio:</b> {bio_display}\n"
+        f"<i>Please wait, connecting accounts...</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+    success_list = []
+    fail_list = []
+
+    for idx, acc in enumerate(targets, 1):
+        phone = acc.get('phone_number', 'Unknown')
+        acc_id = acc['_id']
+        try:
+            session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
+            tg_client = TelegramClient(
+                StringSession(session_str),
+                config.API_ID,
+                config.API_HASH,
+                connection_retries=2,
+                retry_delay=3
+            )
+            await tg_client.connect()
+            if not await tg_client.is_user_authorized():
+                await tg_client.disconnect()
+                db.deactivate_account(acc_id)
+                fail_list.append(f"• <code>{phone}</code>: ❌ Session unauthorized (deactivated)")
+                continue
+
+            await tg_client(UpdateProfileRequest(about=new_bio))
+            db.update_account_bio(acc_id, new_bio)
+            await tg_client.disconnect()
+            success_list.append(f"• <code>{phone}</code>: ✅ Bio updated")
+            logger.info(f"Bio updated successfully for {phone}")
+        except FloodWaitError as e:
+            fail_list.append(f"• <code>{phone}</code>: ⏳ FloodWait ({e.seconds}s)")
+            logger.warning(f"FloodWait updating bio for {phone}: {e.seconds}s")
+        except AboutTooLongError:
+            fail_list.append(f"• <code>{phone}</code>: ❌ Exceeds 70-character limit")
+        except Exception as e:
+            err_msg = str(e)
+            if "about too long" in err_msg.lower():
+                err_msg = "Exceeds 70-character limit"
+            fail_list.append(f"• <code>{phone}</code>: ❌ {err_msg}")
+            logger.error(f"Failed to update bio for {phone}: {e}")
+
+        if len(targets) > 1 and idx % 2 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ <b>Updating Bio...</b> ({idx}/{len(targets)})\n\n"
+                    f"✅ Success: {len(success_list)} | ❌ Issues: {len(fail_list)}",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(0.6)
+
+    report = (
+        f"<blockquote><b>╰_╯ BIO UPDATE COMPLETED! ✅</b></blockquote>\n\n"
+        f"<b>New Bio:</b> {bio_display}\n\n"
+        f"<b>Summary:</b>\n"
+        f"• Total Accounts: {len(targets)}\n"
+        f"• ✅ Success: {len(success_list)}\n"
+        f"• ❌ Failed: {len(fail_list)}\n\n"
+    )
+    details = success_list + fail_list
+    if len(details) <= 12:
+        report += "\n".join(details)
+    else:
+        report += "\n".join(details[:12]) + f"\n<i>...and {len(details) - 12} more</i>"
+
+    await status_msg.edit_text(
+        report,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+    )
+    await send_dm_log(uid, f"<b>✏️ Bio update:</b> {len(success_list)}/{len(targets)} accounts updated.")
+
+
+@pyro.on_callback_query(filters.regex(r"^join_folder_menu$"))
+async def join_folder_menu(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("Please add accounts first!", show_alert=True)
+        return
+
+    caption = (
+        "<blockquote><b>╰_╯ JOIN GROUP FOLDER / CHATLIST 📁</b></blockquote>\n\n"
+        "Automatically make your hosted accounts join all groups from a <b>Telegram Shareable Chat Folder</b> link!\n\n"
+        "<b>Supported Formats:</b>\n"
+        "• <b>Folder link:</b> <code>https://t.me/addlist/...</code> or <code>tg://addlist?slug=...</code>\n"
+        "• <b>Group invite link:</b> <code>https://t.me/+...</code> or <code>https://t.me/joinchat/...</code>\n"
+        "• <b>Group usernames:</b> <code>@groupname</code> (one or multiple)\n\n"
+        "<blockquote>Select target accounts:</blockquote>"
+    )
+
+    perm_folder = getattr(config, 'PERMANENT_GROUP_FOLDER', '')
+    buttons = []
+    if perm_folder:
+        buttons.append([InlineKeyboardButton("⚡ Join Saved Folder (ALL IDs)", callback_data="join_folder_saved_all")])
+    buttons.append([InlineKeyboardButton("🌐 Custom Link (ALL Accounts)", callback_data="join_folder_all")])
+
+    row = []
+    for acc in accounts:
+        phone = acc.get("phone_number", "Acc")
+        acc_id = str(acc["_id"])
+        row.append(InlineKeyboardButton(f"📁 {phone}", callback_data=f"join_folder_acc_{acc_id}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton("Back 🔙", callback_data="menu_main")])
+
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.warning(f"Error in join_folder_menu: {e}")
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^join_folder_saved_all$"))
+async def join_folder_saved_all_cb(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("No accounts available!", show_alert=True)
+        return
+    perm_folder = getattr(config, 'PERMANENT_GROUP_FOLDER', '')
+    if not perm_folder:
+        await cb.answer("No saved permanent folder configured!", show_alert=True)
+        return
+    await cb.answer("Joining saved folder for all accounts...")
+    await perform_join_folder(client, uid, perm_folder, account_ids=None)
+
+
+@pyro.on_callback_query(filters.regex(r"^join_folder_all$"))
+async def join_folder_all_cb(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("No accounts available!", show_alert=True)
+        return
+
+    db.set_user_state(uid, "waiting_folder_all")
+    perm_folder = getattr(config, 'PERMANENT_GROUP_FOLDER', '')
+    caption = (
+        f"<blockquote><b>📁 JOIN FOLDER FOR ALL ACCOUNTS</b></blockquote>\n\n"
+        f"Please send the <b>Telegram Folder Link</b> below:\n"
+        f"<code>https://t.me/addlist/XXXXXX</code>\n\n"
+        + (f"<i>Permanent folder:</i> <code>{perm_folder}</code>\n\n" if perm_folder else "")
+        + f"<i>All {len(accounts)} hosted accounts will join all groups in that folder automatically.</i>\n\n"
+        f"<i>• Send <code>/cancel</code> to abort</i>"
+    )
+    buttons = []
+    if perm_folder:
+        buttons.append([InlineKeyboardButton("⚡ Use Saved Folder", callback_data="join_folder_saved_all")])
+    buttons.append([InlineKeyboardButton("Cancel ❌", callback_data="join_folder_menu")])
+
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^join_folder_saved_acc_"))
+async def join_folder_saved_single_cb(client, cb):
+    uid = cb.from_user.id
+    acc_id = cb.data.replace("join_folder_saved_acc_", "")
+    accounts = db.get_user_accounts(uid)
+    account = next((a for a in accounts if str(a["_id"]) == str(acc_id)), None)
+    if not account:
+        await cb.answer("Account not found!", show_alert=True)
+        return
+    perm_folder = getattr(config, 'PERMANENT_GROUP_FOLDER', '')
+    if not perm_folder:
+        await cb.answer("No saved permanent folder configured!", show_alert=True)
+        return
+    await cb.answer("Joining saved folder for this account...")
+    await perform_join_folder(client, uid, perm_folder, account_ids=[acc_id])
+
+
+@pyro.on_callback_query(filters.regex(r"^join_folder_acc_"))
+async def join_folder_single_cb(client, cb):
+    uid = cb.from_user.id
+    acc_id = cb.data.replace("join_folder_acc_", "")
+    accounts = db.get_user_accounts(uid)
+    account = next((a for a in accounts if str(a["_id"]) == str(acc_id)), None)
+    if not account:
+        await cb.answer("Account not found!", show_alert=True)
+        return
+
+    phone = account.get("phone_number", "Unknown")
+    db.set_user_state(uid, "waiting_folder_single")
+    db.set_user_temp_data(uid, "target_folder_acc", {"acc_id": str(acc_id), "phone": phone})
+
+    perm_folder = getattr(config, 'PERMANENT_GROUP_FOLDER', '')
+    caption = (
+        f"<blockquote><b>📁 JOIN FOLDER FOR {phone}</b></blockquote>\n\n"
+        f"Please send the <b>Telegram Folder Link</b> below:\n"
+        f"<code>https://t.me/addlist/XXXXXX</code>\n\n"
+        + (f"<i>Permanent folder:</i> <code>{perm_folder}</code>\n\n" if perm_folder else "")
+        + f"<i>This account will join all groups in that folder automatically.</i>\n\n"
+        f"<i>• Send <code>/cancel</code> to abort</i>"
+    )
+    buttons = []
+    if perm_folder:
+        buttons.append([InlineKeyboardButton("⚡ Use Saved Folder", callback_data=f"join_folder_saved_acc_{acc_id}")])
+    buttons.append([InlineKeyboardButton("Cancel ❌", callback_data=f"view_acc_{acc_id}")])
+
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+async def perform_join_folder(client, uid, input_text, account_ids=None):
+    input_text = input_text.strip()
+
+    slug_match = re.search(r'(?:t\.me/addlist/|tg://addlist\?slug=)([a-zA-Z0-9_-]+)', input_text)
+    folder_slug = slug_match.group(1) if slug_match else None
+
+    invite_hashes = re.findall(r'(?:t\.me/(?:\+|joinchat/))([a-zA-Z0-9_-]+)', input_text)
+    usernames = re.findall(r'(?:(?:https?://)?t\.me/|@)([a-zA-Z0-9_]{4,32})', input_text)
+    usernames = [u for u in usernames if u.lower() not in ('addlist', 'joinchat', 'c', 'share', 'contact')]
+
+    if not folder_slug and not invite_hashes and not usernames:
+        await client.send_message(
+            uid,
+            "<blockquote><b>❌ Invalid Link!</b></blockquote>\n\n"
+            "Please provide a valid <b>Telegram Folder Link</b>:\n"
+            "• <code>https://t.me/addlist/XXXXXX</code>\n\n"
+            "<i>Or send regular group invite links (https://t.me/+...) or @usernames.</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([[InlineKeyboardButton("Try Again 🔄", callback_data="join_folder_menu"),
+                              InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+        )
+        return
+
+    all_accounts = db.get_user_accounts(uid)
+    if not all_accounts:
+        await client.send_message(uid, "❌ No accounts found.", reply_markup=kb([[InlineKeyboardButton("Dashboard", callback_data="menu_main")]]))
+        return
+
+    if account_ids:
+        targets = [a for a in all_accounts if str(a['_id']) in [str(x) for x in account_ids]]
+    else:
+        targets = [a for a in all_accounts if a.get('is_active', True)]
+
+    if not targets:
+        await client.send_message(uid, "❌ No active accounts to process.", reply_markup=kb([[InlineKeyboardButton("Back", callback_data="join_folder_menu")]]))
+        return
+
+    status_msg = await client.send_message(
+        uid,
+        f"⏳ <b>Starting Group Join across {len(targets)} account(s)...</b>\n\n"
+        f"<i>Connecting accounts and joining chats. Please wait...</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+    success_list = []
+    fail_list = []
+    folder_info_title = None
+    folder_chats_count = 0
+
+    for idx, acc in enumerate(targets, 1):
+        phone = acc.get('phone_number', 'Unknown')
+        acc_id = acc['_id']
+        try:
+            session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
+            tg_client = TelegramClient(
+                StringSession(session_str),
+                config.API_ID,
+                config.API_HASH,
+                connection_retries=2,
+                retry_delay=3
+            )
+            await tg_client.connect()
+            if not await tg_client.is_user_authorized():
+                await tg_client.disconnect()
+                db.deactivate_account(acc_id)
+                fail_list.append(f"• <code>{phone}</code>: ❌ Session unauthorized (deactivated)")
+                continue
+
+            if folder_slug:
+                try:
+                    invite = await tg_client(chatlists.CheckChatlistInviteRequest(slug=folder_slug))
+
+                    if isinstance(invite, chatlist_types.ChatlistInvite):
+                        if not folder_info_title and hasattr(invite, 'title'):
+                            folder_info_title = getattr(invite.title, 'text', str(invite.title)) if hasattr(invite.title, 'text') else str(invite.title)
+
+                        input_peers = []
+                        chats_list = getattr(invite, 'chats', [])
+                        folder_chats_count = len(chats_list)
+                        for ch in chats_list:
+                            try:
+                                input_peers.append(await tg_client.get_input_entity(ch))
+                                db.add_target_group(uid, ch.id, getattr(ch, 'title', str(ch.id)))
+                            except Exception:
+                                pass
+
+                        if not input_peers:
+                            for p in getattr(invite, 'peers', []):
+                                try:
+                                    input_peers.append(await tg_client.get_input_entity(p))
+                                except Exception:
+                                    pass
+
+                        if input_peers:
+                            await tg_client(chatlists.JoinChatlistInviteRequest(
+                                slug=folder_slug,
+                                peers=input_peers
+                            ))
+                            success_list.append(f"• <code>{phone}</code>: ✅ Joined {len(input_peers)} groups from folder")
+                        else:
+                            success_list.append(f"• <code>{phone}</code>: ℹ️ Folder empty or already joined")
+
+                    elif isinstance(invite, chatlist_types.ChatlistInviteAlready):
+                        missing = getattr(invite, 'missing_peers', [])
+                        if missing:
+                            input_peers = []
+                            for p in missing:
+                                try:
+                                    input_peers.append(await tg_client.get_input_entity(p))
+                                except Exception:
+                                    pass
+                            if input_peers:
+                                await tg_client(chatlists.JoinChatlistUpdatesRequest(
+                                    chatlist=InputChatlistDialogFilter(filter_id=invite.filter_id),
+                                    peers=input_peers
+                                ))
+                                success_list.append(f"• <code>{phone}</code>: ✅ Joined {len(input_peers)} new groups")
+                            else:
+                                success_list.append(f"• <code>{phone}</code>: ✅ Already in all groups")
+                        else:
+                            success_list.append(f"• <code>{phone}</code>: ✅ Already joined all groups in folder")
+                    else:
+                        success_list.append(f"• <code>{phone}</code>: ℹ️ Processed folder")
+
+                except FloodWaitError as e:
+                    fail_list.append(f"• <code>{phone}</code>: ⏳ FloodWait ({e.seconds}s)")
+                except ChannelsTooMuchError:
+                    fail_list.append(f"• <code>{phone}</code>: ❌ 500-group limit reached")
+                except InviteHashExpiredError:
+                    fail_list.append(f"• <code>{phone}</code>: ❌ Folder link expired / invalid")
+                except Exception as e:
+                    fail_list.append(f"• <code>{phone}</code>: ❌ {str(e)}")
+
+            else:
+                joined = 0
+                for h in invite_hashes:
+                    try:
+                        res = await tg_client(functions.messages.ImportChatInviteRequest(hash=h))
+                        chats = getattr(res, 'chats', [])
+                        for c in chats:
+                            db.add_target_group(uid, c.id, getattr(c, 'title', str(c.id)))
+                        joined += 1
+                        await asyncio.sleep(1)
+                    except UserAlreadyParticipantError:
+                        joined += 1
+                    except Exception as e:
+                        logger.info(f"Join hash error for {phone}: {e}")
+
+                for u in usernames:
+                    try:
+                        entity = await tg_client.get_entity(u)
+                        await tg_client(functions.channels.JoinChannelRequest(channel=entity))
+                        db.add_target_group(uid, entity.id, getattr(entity, 'title', u))
+                        joined += 1
+                        await asyncio.sleep(1)
+                    except UserAlreadyParticipantError:
+                        joined += 1
+                    except Exception as e:
+                        logger.info(f"Join username error for {phone}: {e}")
+
+                if joined > 0:
+                    success_list.append(f"• <code>{phone}</code>: ✅ Joined {joined} group(s)")
+                else:
+                    fail_list.append(f"• <code>{phone}</code>: ❌ Failed to join links")
+
+            await tg_client.disconnect()
+            logger.info(f"Finished folder join for {phone}")
+
+        except Exception as e:
+            fail_list.append(f"• <code>{phone}</code>: ❌ {str(e)}")
+            logger.error(f"Error during folder join for {phone}: {e}")
+
+        if len(targets) > 1 and idx % 2 == 0:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ <b>Joining Folder/Groups...</b> ({idx}/{len(targets)})\n\n"
+                    f"✅ Processed: {len(success_list)} | ❌ Issues: {len(fail_list)}",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(1.2)
+
+    folder_title_display = f"📁 <b>Folder:</b> <i>{folder_info_title}</i> ({folder_chats_count} groups)\n" if folder_info_title else ""
+    report = (
+        f"<blockquote><b>╰_╯ FOLDER JOIN COMPLETE! ✅</b></blockquote>\n\n"
+        f"{folder_title_display}"
+        f"<b>Summary:</b>\n"
+        f"• Total Accounts: {len(targets)}\n"
+        f"• ✅ Success: {len(success_list)}\n"
+        f"• ❌ Failed: {len(fail_list)}\n\n"
+    )
+    details = success_list + fail_list
+    if len(details) <= 12:
+        report += "\n".join(details)
+    else:
+        report += "\n".join(details[:12]) + f"\n<i>...and {len(details) - 12} more</i>"
+
+    report += "\n\n<i>All joined groups are automatically saved for your ad broadcasting! 🚀</i>"
+
+    await status_msg.edit_text(
+        report,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+    )
+    await send_dm_log(uid, f"<b>📁 Folder join:</b> {len(success_list)}/{len(targets)} accounts joined.")
+
+@pyro.on_callback_query(filters.regex(r"^set_msg$"))
 async def set_msg(client, cb):
     uid = cb.from_user.id
     saved_msgs = db.get_user_ad_messages(uid)
+    count = len(saved_msgs)
+    ad_mode = db.get_user_ad_mode(uid)
 
-    current_status = "Not Set ⭕"
-    if saved_msgs:
-        msg_doc = saved_msgs[0]
-        ad_type = msg_doc.get("ad_type", "text")
-        if ad_type == "both":
-            current_status = "Photo + Text 🖼️📝"
-        elif ad_type == "photo":
-            current_status = "Photo Only 🖼️"
+    if count == 0:
+        status_text = "<b>Current Ad Status:</b> <i>Not Set ⭕</i>\n<i>No ad messages saved yet. Choose an option below:</i>"
+    elif ad_mode == "single" or count == 1:
+        m_doc = saved_msgs[0]
+        atype = m_doc.get("ad_type", "text")
+        type_badge = {
+            "text": "📝 Text Only",
+            "photo": "🖼️ Photo Only",
+            "both": "🖼️📝 Photo + Text",
+            "forward": "📨 Forward (Channel Post)"
+        }.get(atype, atype)
+        prev = m_doc.get("message", "")
+        if prev:
+            prev = prev.replace("\n", " ")
+            if len(prev) > 40:
+                prev = prev[:37] + "..."
+        elif atype == "forward":
+            prev = f"Channel post ({m_doc.get('from_chat_id')}:{m_doc.get('message_id')})"
         else:
-            current_status = "Text Only 📝"
-
-    await cb.message.edit_media(
-        media=InputMediaPhoto(
-            media=config.START_IMAGE,
-            caption=(
-                f"<blockquote>╰_╯ <b>SET YOUR AD TYPE</b></blockquote>\n\n"
-                f"<b>Current:</b> {current_status}\n\n"
-                f"Choose what type of ad you want to broadcast:"
-            ),
-            parse_mode=ParseMode.HTML
-        ),
-        reply_markup=kb([
-            [InlineKeyboardButton("🖼️ Image Only", callback_data="adtype_photo")],
-            [InlineKeyboardButton("📝 Text Only", callback_data="adtype_text")],
-            [InlineKeyboardButton("🖼️📝 Image + Text (Both)", callback_data="adtype_both")],
-            [InlineKeyboardButton("📨 Forward Mode (Premium Emojis)", callback_data="adtype_forward")],
-            [InlineKeyboardButton("Back 🔙", callback_data="menu_main")]
-        ])
-    )
-
-
-@pyro.on_callback_query(filters.regex("^adtype_forward$"))
-async def adtype_forward(client, cb):
-    uid = cb.from_user.id
-    db.set_user_state(uid, "waiting_forward_ad")
-    await cb.message.edit_caption(
-        caption=(
-            "<blockquote><b>╰_╯ FORWARD MODE 📨</b></blockquote>\n\n"
-            "<b>How to set your ad:</b>\n\n"
-            "1️⃣ Post your premium emoji ad to a <b>Telegram channel you own</b>\n"
-            "2️⃣ Open that channel post\n"
-            "3️⃣ Tap <b>Share → Forward</b> → select this bot\n\n"
-            "<b>⚠️ Why not Saved Messages?</b>\n"
-            "<i>Telegram hides the message ID for private chat forwards. "
-            "Only channel post forwards expose the ID needed to re-broadcast.</i>\n\n"
-            "Once set, the bot will forward that exact channel post to all groups — "
-            "premium emojis, stickers, everything preserved ✅"
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb([[InlineKeyboardButton("Cancel 🔙", callback_data="set_msg")]])
-    )
-
-
-@pyro.on_callback_query(filters.regex("^adtype_(photo|text|both)$"))
-async def adtype_select(client, cb):
-    uid = cb.from_user.id
-    ad_type = cb.data.split("_")[1]  # 'photo', 'text', or 'both'
-
-    saved_msgs = db.get_user_ad_messages(uid)
-    if saved_msgs:
-        # Preserve existing content, just update ad_type
-        existing = saved_msgs[0]
-        db.add_user_ad_message(
-            uid,
-            existing.get("message", ""),
-            datetime.now(),
-            photo_path=existing.get("photo_path"),
-            ad_type=ad_type
+            prev = "[Photo File]"
+        status_text = (
+            f"<b>Current Mode:</b> 📝 <b>Single Ad Mode (No Rotation)</b>\n"
+            f"• <b>Type:</b> {type_badge}\n"
+            f"• <b>Preview:</b> <code>{prev}</code>"
+        )
+    else:
+        status_text = (
+            f"<b>Current Mode:</b> 🔄 <b>Multi-Ad Rotation ({count} Ads Active)</b>\n"
+            f"• <i>Ad rotation and group anti-collision are enabled!</i>"
         )
 
-    type_labels = {"photo": "Image Only 🖼️", "text": "Text Only 📝", "both": "Image + Text 🖼️📝"}
-    instructions = {
-        "photo": "Now send a <b>photo</b> (caption is optional).",
-        "text": "Now send your <b>text</b> ad message.",
-        "both": "First send a <b>photo</b> with your text as the caption."
-    }
+    caption = (
+        f"<blockquote>╰_╯ <b>SET AD MESSAGE 📢</b></blockquote>\n\n"
+        f"{status_text}\n\n"
+        f"<b>Choose an option:</b>\n"
+        f"1️⃣ <b>Single Text Ad:</b> Set only 1 text ad (No rotation)\n"
+        f"2️⃣ <b>Photo Ad:</b> Set 1 photo ad (with or without caption)\n"
+        f"3️⃣ <b>Multi-Ad Rotation:</b> Add multiple ads & start ad rotation\n"
+        f"4️⃣ <b>Forward Ad:</b> Channel post forward (premium emojis & stickers)\n\n"
+        f"<i>Select an option below:</i>"
+    )
+
+    rot_btn_label = f"3️⃣ 🔄 Multi-Ad Rotation ({count} Ads)" if count > 1 else "3️⃣ 🔄 Multi-Ad Rotation (Start Rotation)"
+    buttons = [
+        [InlineKeyboardButton("1️⃣ 📝 Single Text Ad (1 Msg Only)", callback_data="adtype_text_single")],
+        [InlineKeyboardButton("2️⃣ 🖼️ Photo Ad", callback_data="adtype_photo_single")],
+        [InlineKeyboardButton(rot_btn_label, callback_data="manage_ads")],
+        [InlineKeyboardButton("4️⃣ 📨 Forward Ad (Channel Post)", callback_data="adtype_forward_single")],
+        [InlineKeyboardButton("Back 🔙", callback_data="menu_main")]
+    ]
+
+    try:
+        await cb.message.edit_media(
+            media=InputMediaPhoto(
+                media=config.START_IMAGE,
+                caption=caption,
+                parse_mode=ParseMode.HTML
+            ),
+            reply_markup=kb(buttons)
+        )
+    except Exception:
+        try:
+            await cb.message.edit_caption(
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb(buttons)
+            )
+        except Exception:
+            try:
+                await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+            except Exception:
+                await cb.message.reply(caption, parse_mode=ParseMode.HTML, reply_markup=kb(buttons))
+
+
+@pyro.on_callback_query(filters.regex(r"^(manage_ads|add_ad_choice)$"))
+async def manage_ads(client, cb):
+    uid = cb.from_user.id
+    db.set_user_ad_mode(uid, "rotation")  # Entering Multi-Ad Rotation activates rotation mode!
+    saved_msgs = db.get_user_ad_messages(uid)
+    count = len(saved_msgs)
+
+    if count == 0:
+        ads_list = "<i>• No rotation ads added yet. Tap '➕ Add Ad to Rotation' below to add your ads!</i>\n"
+    else:
+        ads_list = f"<b>Configured Rotation Ads ({count}):</b>\n\n"
+        for idx, m_doc in enumerate(saved_msgs, 1):
+            atype = m_doc.get("ad_type", "text")
+            type_badge = {
+                "text": "📝 Text",
+                "photo": "🖼️ Photo",
+                "both": "🖼️📝 Photo+Text",
+                "forward": "📨 Forward"
+            }.get(atype, atype)
+
+            preview = m_doc.get("message", "")
+            if preview:
+                preview_clean = preview.replace("\n", " ")
+                if len(preview_clean) > 35:
+                    preview_clean = preview_clean[:32] + "..."
+            elif atype == "forward":
+                preview_clean = f"Channel post ({m_doc.get('from_chat_id')}:{m_doc.get('message_id')})"
+            elif atype == "photo":
+                preview_clean = "[Photo File]"
+            else:
+                preview_clean = "None"
+
+            ads_list += f"• <b>Ad #{idx}</b> [{type_badge}]: <code>{preview_clean}</code>\n"
+
+    caption = (
+        f"<blockquote>╰_╯ <b>3️⃣ MULTI-AD ROTATION MANAGER 🔄</b></blockquote>\n\n"
+        f"<b>Status:</b> 🔄 Rotation Mode Activated ✅\n\n"
+        f"{ads_list}\n"
+        f"<b>Smart Rotation Rules:</b>\n"
+        f"• <b>Ad Rotation Active:</b> Since you chose this option, ad rotation will start when broadcasting!\n"
+        f"• <b>Cycle Shift:</b> Cycle 1: Acc 1 ➔ Ad #1, Acc 2 ➔ Ad #2. Cycle 2: Acc 1 ➔ Ad #2, Acc 2 ➔ Ad #3, and so on.\n"
+        f"• <b>Anti-Collision:</b> If multiple accounts post in the same group, they alternate ads so that no group ever receives duplicate consecutive ads!"
+    )
+
+    buttons = [
+        [InlineKeyboardButton("➕ Add Ad to Rotation", callback_data="add_rot_choice")]
+    ]
+
+    # Individual delete buttons for each ad
+    if saved_msgs:
+        del_row = []
+        for idx, m_doc in enumerate(saved_msgs, 1):
+            ad_id = str(m_doc["_id"])
+            del_row.append(InlineKeyboardButton(f"🗑️ Del #{idx}", callback_data=f"del_ad_{ad_id}"))
+            if len(del_row) == 3:
+                buttons.append(del_row)
+                del_row = []
+        if del_row:
+            buttons.append(del_row)
+        buttons.append([InlineKeyboardButton("❌ Clear All Rotation Ads", callback_data="clear_all_ads")])
+
+    buttons.append([InlineKeyboardButton("Back 🔙", callback_data="set_msg")])
+
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        try:
+            await cb.message.edit_media(
+                media=InputMediaPhoto(media=config.START_IMAGE, caption=caption, parse_mode=ParseMode.HTML),
+                reply_markup=kb(buttons)
+            )
+        except Exception:
+            await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^add_rot_choice$"))
+async def add_rot_choice_cb(client, cb):
+    uid = cb.from_user.id
+    saved_msgs = db.get_user_ad_messages(uid)
+    next_num = len(saved_msgs) + 1
+
+    caption = (
+        f"<blockquote><b>╰_╯ ADD ROTATION AD #{next_num} ➕</b></blockquote>\n\n"
+        f"Choose format for Rotation Ad #{next_num}:\n\n"
+        f"• <b>Text Ad:</b> Plain or styled text message\n"
+        f"• <b>Photo Ad:</b> Photo with optional text caption\n"
+        f"• <b>Forward Ad:</b> Channel post forward (premium emojis & stickers)\n\n"
+        f"<i>This ad will be added to your rotation queue and cycle automatically!</i>"
+    )
+    buttons = [
+        [InlineKeyboardButton("📝 Text Ad", callback_data="rot_add_text")],
+        [InlineKeyboardButton("🖼️ Photo Ad", callback_data="rot_add_photo")],
+        [InlineKeyboardButton("📨 Forward Ad (Channel Post)", callback_data="rot_add_forward")],
+        [InlineKeyboardButton("Cancel 🔙", callback_data="manage_ads")]
+    ]
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^rot_add_(text|photo|forward)$"))
+async def rot_add_select(client, cb):
+    uid = cb.from_user.id
+    ad_type = cb.data.split("_")[2]  # 'text', 'photo', or 'forward'
+
+    db.set_user_temp_data(uid, "new_ad_type", {"ad_type": ad_type, "is_rotation": True})
 
     if ad_type == "text":
         db.set_user_state(uid, "waiting_broadcast_msg_text")
-    else:
+        prompt = "Now send your <b>text ad message</b> to add to rotation.\n\n• <i>Send <code>/cancel</code> to abort</i>"
+    elif ad_type == "photo":
         db.set_user_state(uid, "waiting_broadcast_msg_photo")
+        prompt = "Now send a <b>photo</b> (with optional text caption) to add to rotation.\n\n• <i>Send <code>/cancel</code> to abort</i>"
+    else:
+        db.set_user_state(uid, "waiting_forward_ad")
+        prompt = (
+            "Now <b>forward a channel post</b> from a channel you own to add to rotation.\n\n"
+            "• <i>Telegram channel forwards preserve all premium emojis & stickers.</i>\n"
+            "• <i>Send <code>/cancel</code> to abort</i>"
+        )
 
-    await cb.message.edit_caption(
-        caption=(
-            f"<blockquote><b>╰_╯ AD TYPE: {type_labels[ad_type]}</b></blockquote>\n\n"
-            f"{instructions[ad_type]}\n\n"
-            f"<i>Tips: Keep it concise, use emojis, include a clear call-to-action.</i>"
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb([[InlineKeyboardButton("Back 🔙", callback_data="set_msg")]])
+    caption = (
+        f"<blockquote><b>╰_╯ ADD ROTATION AD: {ad_type.upper()} 🔄</b></blockquote>\n\n"
+        f"{prompt}"
     )
+    buttons = [[InlineKeyboardButton("Cancel 🔙", callback_data="manage_ads")]]
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^del_ad_"))
+async def del_ad_cb(client, cb):
+    uid = cb.from_user.id
+    ad_id = cb.data.replace("del_ad_", "")
+    ok = db.delete_user_ad_message(uid, ad_id)
+    if ok:
+        await cb.answer("Ad message deleted!", show_alert=False)
+    else:
+        await cb.answer("Ad message not found!", show_alert=True)
+    await manage_ads(client, cb)
+
+
+@pyro.on_callback_query(filters.regex(r"^clear_all_ads$"))
+async def clear_all_ads_cb(client, cb):
+    uid = cb.from_user.id
+    cnt = db.clear_user_ad_messages(uid)
+    await cb.answer(f"Cleared {cnt} ad message(s)!", show_alert=True)
+    await manage_ads(client, cb)
+
+
+@pyro.on_callback_query(filters.regex(r"^(adtype_forward|adtype_forward_single)$"))
+async def adtype_forward(client, cb):
+    uid = cb.from_user.id
+    db.set_user_temp_data(uid, "new_ad_type", {"ad_type": "forward", "is_rotation": False})
+    db.set_user_state(uid, "waiting_forward_ad")
+    caption = (
+        "<blockquote><b>╰_╯ 4️⃣ SINGLE FORWARD AD 📨</b></blockquote>\n\n"
+        "<b>How to set your single forward ad:</b>\n\n"
+        "1️⃣ Post your premium emoji ad to a <b>Telegram channel you own</b>\n"
+        "2️⃣ Open that channel post\n"
+        "3️⃣ Tap <b>Share → Forward</b> → select this bot\n\n"
+        "<b>⚠️ Why channel posts?</b>\n"
+        "<i>Telegram hides the message ID for private chat forwards. "
+        "Channel post forwards expose the ID needed to re-broadcast.</i>\n\n"
+        "• <i>This sets 1 single forward ad for broadcasting (No rotation).</i>\n"
+        "• <i>Send <code>/cancel</code> to abort</i>"
+    )
+    buttons = [[InlineKeyboardButton("Cancel 🔙", callback_data="set_msg")]]
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^(adtype_text|adtype_text_single)$"))
+async def adtype_text_single(client, cb):
+    uid = cb.from_user.id
+    db.set_user_temp_data(uid, "new_ad_type", {"ad_type": "text", "is_rotation": False})
+    db.set_user_state(uid, "waiting_broadcast_msg_text")
+
+    caption = (
+        "<blockquote><b>╰_╯ 1️⃣ SINGLE TEXT AD (1 MSG ONLY) 📝</b></blockquote>\n\n"
+        "Now send your <b>text ad message</b> in this chat.\n\n"
+        "• <i>This will set 1 single ad message (No rotation).</i>\n"
+        "• <i>All broadcast accounts will send this exact message.</i>\n"
+        "• <i>Formatting (bold, italic, links, monospace) will be preserved!</i>\n"
+        "• <i>Send <code>/cancel</code> to abort</i>"
+    )
+    buttons = [[InlineKeyboardButton("Cancel 🔙", callback_data="set_msg")]]
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^(adtype_photo|adtype_photo_single|adtype_both)$"))
+async def adtype_photo_single(client, cb):
+    uid = cb.from_user.id
+    db.set_user_temp_data(uid, "new_ad_type", {"ad_type": "photo", "is_rotation": False})
+    db.set_user_state(uid, "waiting_broadcast_msg_photo")
+
+    caption = (
+        "<blockquote><b>╰_╯ 2️⃣ PHOTO AD 🖼️</b></blockquote>\n\n"
+        "Now send a <b>photo</b> in this chat.\n\n"
+        "• <i>You can include a text caption with the photo or send photo only!</i>\n"
+        "• <i>This sets 1 photo ad message for broadcasting (No rotation).</i>\n"
+        "• <i>Send <code>/cancel</code> to abort</i>"
+    )
+    buttons = [[InlineKeyboardButton("Cancel 🔙", callback_data="set_msg")]]
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
 
 @pyro.on_callback_query(filters.regex("set_delay"))
 async def set_delay(client, cb):
@@ -2021,27 +2981,6 @@ async def start(client, m):
         logger.error(f"╰_╯Failed to send start message to {uid}: {e}")
         await m.reply("╰_╯Error starting bot. Please try again or contact support.")
 
-@pyro.on_message(filters.text & filters.regex(r"https?://t\.me/.*") & filters.private & ~filters.command(["start", "bd", "me", "stats", "stop"]))
-async def handle_group_link(client, m):
-    uid = m.from_user.id
-    state = db.get_user_state(uid)
-    if state != "waiting_group_link":
-        return
-    link = m.text.strip()
-    try:
-        tg_client = TelegramClient(StringSession(), config.API_ID, config.API_HASH)
-        await tg_client.connect()
-        chat = await tg_client.get_entity(link)
-        db.add_target_group(uid, chat.id, chat.title)
-        await m.reply(f"<blockquote><b>✅ Group <i>{chat.title}</i> added! ✨</b></blockquote>", parse_mode=ParseMode.HTML)
-        await send_dm_log(uid, f"<b>🎯 Group added:</b> <i>{chat.title}</i> ✨")
-        db.set_user_state(uid, "")
-        await tg_client.disconnect()
-    except Exception as e:
-        await m.reply(f"<blockquote><b>❌ Failed to add group:</b> <i>{str(e)}</i> 😔</blockquote>", parse_mode=ParseMode.HTML)
-        await send_dm_log(uid, f"<b>❌ Failed to add group:</b> {str(e)} 😔")
-        logger.error(f"Failed to add group for {uid}: {e}")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FORWARD-AD HANDLER — runs in group -1 so it has priority over all group 0
@@ -2092,26 +3031,66 @@ async def handle_forward_ad(client, m):
         )
         raise StopPropagation
 
+    temp_info = db.get_user_temp_data(uid, "new_ad_type") or {}
+    is_rotation = temp_info.get("is_rotation", False)
+
     try:
-        db.add_user_ad_message(
-            uid, "", datetime.now(),
-            photo_path=None, ad_type="forward",
-            entities=[],
-            from_chat_id=fwd_chat_id,
-            message_id=fwd_msg_id
-        )
-        db.set_user_state(uid, "")
-        logger.info(f"Forward-mode ad set for {uid}: from_chat={fwd_chat_id} msg_id={fwd_msg_id}")
-        await m.reply(
-            "<blockquote><b>╰_╯ FORWARD AD SET! ✅</b></blockquote>\n\n"
-            f"Source channel: <code>{fwd_chat_id}</code>\n"
-            f"Message ID: <code>{fwd_msg_id}</code>\n\n"
-            "<b>Broadcasting will forward this exact message</b> —\n"
-            "premium emojis, stickers, and all formatting preserved! 🚀",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
-        )
-        await send_dm_log(uid, f"<b>📨 Forward-mode ad set:</b> chat <code>{fwd_chat_id}</code> msg <code>{fwd_msg_id}</code>")
+        if not is_rotation:
+            # Single ad mode: clear previous ads, save this 1 forward ad
+            db.clear_user_ad_messages(uid)
+            db.add_user_ad_message(
+                uid, "", datetime.now(),
+                photo_path=None, ad_type="forward",
+                entities=[],
+                from_chat_id=fwd_chat_id,
+                message_id=fwd_msg_id
+            )
+            db.set_user_ad_mode(uid, "single")
+            db.set_user_state(uid, "")
+            db.set_user_temp_data(uid, "new_ad_type", None)
+            logger.info(f"Single forward ad set for {uid}: from_chat={fwd_chat_id} msg_id={fwd_msg_id}")
+            await m.reply(
+                f"<blockquote><b>╰_╯ SINGLE FORWARD AD SET! ✅</b></blockquote>\n\n"
+                f"• <b>Mode:</b> Single Message (1 Ad Only - No Rotation)\n"
+                f"• <b>Source Channel:</b> <code>{fwd_chat_id}</code>\n"
+                f"• <b>Message ID:</b> <code>{fwd_msg_id}</code>\n\n"
+                "Broadcasting will forward this exact message across all accounts with no rotation! 🚀",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb([
+                    [InlineKeyboardButton("3️⃣ 🔄 Multi-Ad Rotation", callback_data="manage_ads")],
+                    [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+                ])
+            )
+            await send_dm_log(uid, f"<b>📨 Single forward ad set:</b> chat <code>{fwd_chat_id}</code> msg <code>{fwd_msg_id}</code>")
+        else:
+            # Multi-ad rotation mode: append to queue
+            db.add_user_ad_message(
+                uid, "", datetime.now(),
+                photo_path=None, ad_type="forward",
+                entities=[],
+                from_chat_id=fwd_chat_id,
+                message_id=fwd_msg_id
+            )
+            db.set_user_ad_mode(uid, "rotation")
+            db.set_user_state(uid, "")
+            db.set_user_temp_data(uid, "new_ad_type", None)
+            total_ads = len(db.get_user_ad_messages(uid))
+            logger.info(f"Rotation forward ad #{total_ads} added for {uid}: from_chat={fwd_chat_id} msg_id={fwd_msg_id}")
+            await m.reply(
+                f"<blockquote><b>╰_╯ ROTATION AD #{total_ads} ADDED! ✅</b></blockquote>\n\n"
+                f"• <b>Mode:</b> 🔄 Multi-Ad Rotation Active\n"
+                f"• <b>Source Channel:</b> <code>{fwd_chat_id}</code>\n"
+                f"• <b>Message ID:</b> <code>{fwd_msg_id}</code>\n"
+                f"• <b>Total Rotating Ads:</b> <code>{total_ads}</code>\n\n"
+                "Broadcasting will forward this message in rotation — premium emojis preserved! 🚀",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb([
+                    [InlineKeyboardButton("➕ Add Another Ad to Rotation", callback_data="add_rot_choice"),
+                     InlineKeyboardButton("📋 View Rotation Queue", callback_data="manage_ads")],
+                    [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+                ])
+            )
+            await send_dm_log(uid, f"<b>📨 Rotation forward ad #{total_ads} added:</b> chat <code>{fwd_chat_id}</code> msg <code>{fwd_msg_id}</code>")
     except Exception as e:
         logger.error(f"Failed to save forward-mode ad for {uid}: {e}")
         db.set_user_state(uid, "")
@@ -2129,51 +3108,84 @@ async def handle_photo_message(client, m):
     if state in ("waiting_broadcast_msg", "waiting_broadcast_msg_photo"):
         try:
             os.makedirs("downloads", exist_ok=True)
-            photo_file = await client.download_media(m.photo, file_name=f"downloads/{uid}_ad.jpg")
+            timestamp = int(time.time())
+            photo_file = await client.download_media(m.photo, file_name=f"downloads/{uid}_ad_{timestamp}_{random.randint(100, 999)}.jpg")
             caption_text = m.caption or ""
 
-            # Determine ad_type from state
-            if state == "waiting_broadcast_msg_photo":
-                # Check current DB ad_type to keep 'both' vs 'photo'
-                saved = db.get_user_ad_messages(uid)
-                ad_type = saved[0].get("ad_type", "photo") if saved else "photo"
-                if ad_type not in ("photo", "both"):
-                    ad_type = "photo"
-            else:
+            temp_info = db.get_user_temp_data(uid, "new_ad_type") or {}
+            is_rotation = temp_info.get("is_rotation", False)
+            ad_type = temp_info.get("ad_type")
+            if not ad_type or ad_type == "photo":
                 ad_type = "both" if caption_text else "photo"
 
-            # Capture caption entities (premium emojis, bold, etc.)
             caption_entities = entities_to_dict(m.caption_entities or [])
 
-            db.add_user_ad_message(
-                uid, caption_text, datetime.now(),
-                photo_path=photo_file, ad_type=ad_type,
-                entities=caption_entities
-            )
-            db.set_user_state(uid, "")
+            if not is_rotation:
+                # Single photo ad mode: clear previous ads, save this 1 photo ad
+                db.clear_user_ad_messages(uid)
+                db.add_user_ad_message(
+                    uid, caption_text, datetime.now(),
+                    photo_path=photo_file, ad_type=ad_type,
+                    entities=caption_entities
+                )
+                db.set_user_ad_mode(uid, "single")
+                db.set_user_state(uid, "")
+                db.set_user_temp_data(uid, "new_ad_type", None)
 
-            type_label = "Photo + Text 🖼️📝" if (ad_type == "both" and caption_text) else "Photo Only 🖼️"
-            caption_preview = f"<code>{caption_text}</code>" if caption_text else "<i>No text caption</i>"
-            await m.reply(
-                f"<blockquote><b>╰_╯ AD SET! ✅</b></blockquote>\n\n"
-                f"<u>Type:</u> {type_label}\n"
-                f"<u>Caption Preview:</u>\n{caption_preview}\n\n"
-                f"<b>Ready to broadcast!</b>\n"
-                f"<i>Start your campaign from the dashboard.</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
-            )
-            await send_dm_log(uid, f"<b>🖼️ Ad Photo updated!</b> Type: {type_label} | Caption: <code>{caption_text[:50] if caption_text else 'None'}</code>")
-            logger.info(f"Ad photo set for user {uid}: path={photo_file}, ad_type={ad_type}")
+                type_label = "Photo + Text 🖼️📝" if (ad_type == "both" and caption_text) else "Photo Only 🖼️"
+                caption_preview = f"<code>{caption_text}</code>" if caption_text else "<i>No text caption</i>"
+                await m.reply(
+                    f"<blockquote><b>╰_╯ SINGLE PHOTO AD SET! ✅</b></blockquote>\n\n"
+                    f"• <b>Mode:</b> Single Message (1 Ad Only - No Rotation)\n"
+                    f"• <b>Type:</b> {type_label}\n"
+                    f"• <b>Caption:</b> {caption_preview}\n\n"
+                    f"<i>Broadcasting will send this 1 photo ad across all accounts with no rotation!</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb([
+                        [InlineKeyboardButton("3️⃣ 🔄 Multi-Ad Rotation", callback_data="manage_ads")],
+                        [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+                    ])
+                )
+                await send_dm_log(uid, f"<b>🖼️ Single Photo Ad set:</b> {type_label}")
+                logger.info(f"Single ad photo set for user {uid}: path={photo_file}, ad_type={ad_type}")
+            else:
+                # Multi-ad rotation mode: append to queue
+                db.add_user_ad_message(
+                    uid, caption_text, datetime.now(),
+                    photo_path=photo_file, ad_type=ad_type,
+                    entities=caption_entities
+                )
+                db.set_user_ad_mode(uid, "rotation")
+                db.set_user_state(uid, "")
+                db.set_user_temp_data(uid, "new_ad_type", None)
+
+                total_ads = len(db.get_user_ad_messages(uid))
+                type_label = "Photo + Text 🖼️📝" if (ad_type == "both" and caption_text) else "Photo Only 🖼️"
+                caption_preview = f"<code>{caption_text}</code>" if caption_text else "<i>No text caption</i>"
+                await m.reply(
+                    f"<blockquote><b>╰_╯ ROTATION AD #{total_ads} ADDED! ✅</b></blockquote>\n\n"
+                    f"• <b>Mode:</b> 🔄 Multi-Ad Rotation Active\n"
+                    f"• <b>Type:</b> {type_label}\n"
+                    f"• <b>Total Rotating Ads:</b> <code>{total_ads}</code>\n"
+                    f"• <b>Caption:</b> {caption_preview}\n\n"
+                    f"<i>This ad has been added to your rotation queue! Ad rotation will run when broadcasting.</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb([
+                        [InlineKeyboardButton("➕ Add Another Ad to Rotation", callback_data="add_rot_choice"),
+                         InlineKeyboardButton("📋 View Rotation Queue", callback_data="manage_ads")],
+                        [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+                    ])
+                )
+                await send_dm_log(uid, f"<b>🖼️ Rotation Ad #{total_ads} added:</b> {type_label}")
+                logger.info(f"Ad photo #{total_ads} added for user {uid}: path={photo_file}, ad_type={ad_type}")
         except Exception as e:
             logger.error(f"Failed to add ad photo for user {uid}: {e}")
             db.set_user_state(uid, "")
             await m.reply(
                 f"<blockquote><b>❌ Failed to save ad photo!</b></blockquote>\n\n"
-                f"<u>Error:</u> <i>{str(e)}</i>\n"
-                f"<b>Contact Support:</b> @{config.ADMIN_USERNAME}",
+                f"<u>Error:</u> <i>{str(e)}</i>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+                reply_markup=kb([[InlineKeyboardButton("Back", callback_data="set_msg")]])
             )
             await send_dm_log(uid, f"<b>❌ Failed to set ad photo:</b> {str(e)}")
 
@@ -2182,6 +3194,68 @@ async def handle_text_message(client, m):
     uid = m.from_user.id
     state = db.get_user_state(uid)
     text = m.text.strip()
+
+    # ── Global /cancel handling ──────────────────────────────────────────────
+    if text.lower() == "/cancel":
+        if state:
+            db.set_user_state(uid, "")
+            db.set_temp_data(uid, None)
+            await m.reply(
+                "<blockquote><b>🚫 Action cancelled.</b></blockquote>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+            )
+            return
+
+    # ── Bio Update States ────────────────────────────────────────────────────
+    if state == "waiting_bio_all":
+        db.set_user_state(uid, "")
+        await perform_bio_update(client, uid, text, account_ids=None)
+        return
+
+    if state == "waiting_bio_single":
+        temp_data = db.get_user_temp_data(uid, "target_bio_acc") or {}
+        acc_id = temp_data.get("acc_id")
+        db.set_user_state(uid, "")
+        if not acc_id:
+            await m.reply("❌ Error: Target account not found. Please try again.", reply_markup=kb([[InlineKeyboardButton("Back", callback_data="change_bio_menu")]]))
+            return
+        await perform_bio_update(client, uid, text, account_ids=[acc_id])
+        return
+
+    # ── Folder / Group Link Join States ──────────────────────────────────────
+    if state == "waiting_folder_all":
+        db.set_user_state(uid, "")
+        await perform_join_folder(client, uid, text, account_ids=None)
+        return
+
+    if state == "waiting_folder_single":
+        temp_data = db.get_user_temp_data(uid, "target_folder_acc") or {}
+        acc_id = temp_data.get("acc_id")
+        db.set_user_state(uid, "")
+        if not acc_id:
+            await m.reply("❌ Error: Target account not found. Please try again.", reply_markup=kb([[InlineKeyboardButton("Back", callback_data="join_folder_menu")]]))
+            return
+        await perform_join_folder(client, uid, text, account_ids=[acc_id])
+        return
+
+    # ── Legacy Single Group Link State ───────────────────────────────────────
+    if state == "waiting_group_link":
+        link = text
+        try:
+            tg_client = TelegramClient(StringSession(), config.API_ID, config.API_HASH)
+            await tg_client.connect()
+            chat = await tg_client.get_entity(link)
+            db.add_target_group(uid, chat.id, chat.title)
+            await m.reply(f"<blockquote><b>✅ Group <i>{chat.title}</i> added! ✨</b></blockquote>", parse_mode=ParseMode.HTML)
+            await send_dm_log(uid, f"<b>🎯 Group added:</b> <i>{chat.title}</i> ✨")
+            db.set_user_state(uid, "")
+            await tg_client.disconnect()
+        except Exception as e:
+            await m.reply(f"<blockquote><b>❌ Failed to add group:</b> <i>{str(e)}</i> 😔</blockquote>", parse_mode=ParseMode.HTML)
+            await send_dm_log(uid, f"<b>❌ Failed to add group:</b> {str(e)} 😔")
+            logger.error(f"Failed to add group for {uid}: {e}")
+        return
 
     # ── Auto-reply message setting ───────────────────────────────────────────
     if state == "waiting_auto_reply":
@@ -2249,17 +3323,23 @@ async def handle_text_message(client, m):
                 message_id=int(fwd_msg_id)
             )
             db.set_user_state(uid, "")
-            logger.info(f"Forward-mode ad set for {uid}: from_chat={fwd_chat_id} msg_id={fwd_msg_id}")
+            total_ads = len(db.get_user_ad_messages(uid))
+            logger.info(f"Forward-mode ad #{total_ads} set for {uid}: from_chat={fwd_chat_id} msg_id={fwd_msg_id}")
             await m.reply(
-                "<blockquote><b>╰_╯ FORWARD AD SET! ✅</b></blockquote>\n\n"
-                f"Source chat: <code>{fwd_chat_id}</code>\n"
-                f"Message ID: <code>{fwd_msg_id}</code>\n\n"
+                f"<blockquote><b>╰_╯ FORWARD AD #{total_ads} ADDED! ✅</b></blockquote>\n\n"
+                f"• <b>Source Chat:</b> <code>{fwd_chat_id}</code>\n"
+                f"• <b>Message ID:</b> <code>{fwd_msg_id}</code>\n"
+                f"• <b>Total Rotation Ads:</b> <code>{total_ads}</code>\n\n"
                 "<b>Broadcasting will forward this exact message</b> —\n"
                 "premium emojis, stickers, and all formatting preserved! 🚀",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
+                reply_markup=kb([
+                    [InlineKeyboardButton("➕ Add Another Ad", callback_data="set_msg"),
+                     InlineKeyboardButton("📋 View All Ads", callback_data="manage_ads")],
+                    [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+                ])
             )
-            await send_dm_log(uid, f"<b>📨 Forward-mode ad set:</b> chat <code>{fwd_chat_id}</code> msg <code>{fwd_msg_id}</code>")
+            await send_dm_log(uid, f"<b>📨 Forward-mode ad #{total_ads} added:</b> chat <code>{fwd_chat_id}</code> msg <code>{fwd_msg_id}</code>")
         except Exception as e:
             logger.error(f"Failed to set forward-mode ad for {uid}: {e}")
             db.set_user_state(uid, "")
@@ -2285,26 +3365,68 @@ async def handle_text_message(client, m):
             from_chat_id = m.chat.id
             message_id   = m.id
 
-            db.add_user_ad_message(
-                uid, text, datetime.now(),
-                photo_path=None, ad_type=ad_type,
-                entities=msg_entities,
-                from_chat_id=from_chat_id,
-                message_id=message_id
-            )
-            db.set_user_state(uid, "")
-            entity_count = len(msg_entities)
-            logger.info(f"Ad text set for {uid}: {len(text)} chars, {entity_count} entities, msg_id={message_id}")
-            await m.reply(
-                f"<blockquote><b>╰_╯ AD MESSAGE SET!✅</b></blockquote>\n\n"
-                f"<u>Message Preview:</u>\n<code>{text}</code>\n\n"
-                f"<b>Ready to broadcast!</b>\n"
-                f"<i>Start your campaign from the dashboard.</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
-            )
-            await send_dm_log(uid, f"<b>📝 Ad message updated:</b> <code>{text[:50]}{'...' if len(text) > 50 else ''}</code>")
-            logger.info(f"Ad message set for user {uid}: {text[:50]}...")
+            temp_info = db.get_user_temp_data(uid, "new_ad_type") or {}
+            is_rotation = temp_info.get("is_rotation", False)
+
+            if not is_rotation:
+                # 1st Option: ONLY add 1 msg! Clear previous and set 1 single ad
+                db.clear_user_ad_messages(uid)
+                db.add_user_ad_message(
+                    uid, text, datetime.now(),
+                    photo_path=None, ad_type=ad_type,
+                    entities=msg_entities,
+                    from_chat_id=from_chat_id,
+                    message_id=message_id
+                )
+                db.set_user_ad_mode(uid, "single")
+                db.set_user_state(uid, "")
+                db.set_user_temp_data(uid, "new_ad_type", None)
+                entity_count = len(msg_entities)
+                logger.info(f"Single ad text set for {uid}: {len(text)} chars, {entity_count} entities, msg_id={message_id}")
+                await m.reply(
+                    f"<blockquote><b>╰_╯ SINGLE AD MESSAGE SET! ✅</b></blockquote>\n\n"
+                    f"• <b>Mode:</b> 📝 Single Message (1 Ad Only - No Rotation)\n"
+                    f"• <b>Preview:</b>\n<code>{text[:200]}{'...' if len(text) > 200 else ''}</code>\n\n"
+                    f"<i>Broadcasting will send this 1 message across all accounts with no rotation!</i>\n"
+                    f"<i>To broadcast multiple rotating messages, select Option 3 (Multi-Ad Rotation).</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb([
+                        [InlineKeyboardButton("3️⃣ 🔄 Multi-Ad Rotation", callback_data="manage_ads")],
+                        [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+                    ])
+                )
+                await send_dm_log(uid, f"<b>📝 Single Ad message set:</b> <code>{text[:50]}{'...' if len(text) > 50 else ''}</code>")
+            else:
+                # 3rd Option: Add to rotation queue!
+                db.add_user_ad_message(
+                    uid, text, datetime.now(),
+                    photo_path=None, ad_type=ad_type,
+                    entities=msg_entities,
+                    from_chat_id=from_chat_id,
+                    message_id=message_id
+                )
+                db.set_user_ad_mode(uid, "rotation")
+                db.set_user_state(uid, "")
+                db.set_user_temp_data(uid, "new_ad_type", None)
+                total_ads = len(db.get_user_ad_messages(uid))
+                entity_count = len(msg_entities)
+                logger.info(f"Rotation ad text #{total_ads} set for {uid}: {len(text)} chars, {entity_count} entities, msg_id={message_id}")
+                await m.reply(
+                    f"<blockquote><b>╰_╯ ROTATION AD #{total_ads} ADDED! ✅</b></blockquote>\n\n"
+                    f"• <b>Mode:</b> 🔄 Multi-Ad Rotation Active\n"
+                    f"• <b>Type:</b> 📝 Text Only\n"
+                    f"• <b>Total Rotating Ads:</b> <code>{total_ads}</code>\n"
+                    f"• <b>Preview:</b>\n<code>{text[:200]}{'...' if len(text) > 200 else ''}</code>\n\n"
+                    f"<i>This ad has been added to your rotation queue! Ad rotation will start when broadcasting.</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb([
+                        [InlineKeyboardButton("➕ Add Another Ad to Rotation", callback_data="add_rot_choice"),
+                         InlineKeyboardButton("📋 View Rotation Queue", callback_data="manage_ads")],
+                        [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+                    ])
+                )
+                await send_dm_log(uid, f"<b>📝 Rotation Ad #{total_ads} added:</b> <code>{text[:50]}{'...' if len(text) > 50 else ''}</code>")
+            logger.info(f"Ad message #{total_ads} set for user {uid}: {text[:50]}...")
         except Exception as e:
             logger.error(f"Failed to add ad message for user {uid}: {e}")
             db.set_user_state(uid, "")

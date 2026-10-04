@@ -1,4 +1,9 @@
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Telegram API Credentials
 API_ID = int(os.getenv("API_ID", "0"))
@@ -12,7 +17,10 @@ LOGGER_BOT_USERNAME = "AdbotLogv7bot"
 # Admin Settings
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ADMIN_USERNAME = "TecxoChat"
-ADMIN_IDS = [int(os.getenv("ADMIN_ID", "0"))]
+ADMIN_IDS = [ADMIN_ID] if ADMIN_ID else []
+
+# Permanent Group Folder Link
+PERMANENT_GROUP_FOLDER = os.getenv("PERMANENT_GROUP_FOLDER", "https://t.me/addlist/Qt31BHYkGgk2MGFl")
 
 # Image URLs
 START_IMAGE = "https://graph.org/file/9878e0f9785f390f5b5a3-2ae056edc4003b40e2.jpg"

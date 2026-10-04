@@ -15,7 +15,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/TecxoAds.log'),
+        logging.FileHandler('logs/TecxoAds.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -28,8 +28,70 @@ class EnhancedDatabaseManager:
         self._init_db()
         self._load_persistent_globals()
 
+    def _create_indexes(self):
+        # Helper function to ensure index with specific options and retries
+        def ensure_index(collection, key, **kwargs):
+            index_key = key if isinstance(key, list) else [(key, pymongo.ASCENDING)]
+            index_name = "_".join(f"{k}_{v}" for k, v in index_key)
+            index_retry_delay = 1
+            for index_attempt in range(3):
+                try:
+                    existing_indexes = collection.index_information()
+                    if index_name in existing_indexes:
+                        existing_unique = existing_indexes[index_name].get('unique', False)
+                        desired_unique = kwargs.get('unique', False)
+                        if existing_unique != desired_unique:
+                            collection.drop_index(index_name)
+                            logger.info(f"Dropped conflicting index {index_name} on {collection.name}")
+                        else:
+                            return
+                    collection.create_index(key, name=index_name, **kwargs)
+                    return
+                except OperationFailure as e:
+                    logger.error(f"Failed to create index {index_name} on {collection.name} (attempt {index_attempt + 1}): {e}")
+                    if index_attempt < 2:
+                        time.sleep(index_retry_delay)
+                        index_retry_delay *= 2
+                    else:
+                        raise
+                except Exception as e:
+                    logger.debug(f"Index setup notice: {e}")
+                    return
+
+        # Create indexes for efficient queries
+        try:
+            ensure_index(self.db.users, "user_id", unique=True)
+            ensure_index(self.db.accounts, [("user_id", pymongo.ASCENDING), ("phone_number", pymongo.ASCENDING)])
+            ensure_index(self.db.ad_messages, "user_id")
+            ensure_index(self.db.ad_delays, "user_id", unique=True)
+            ensure_index(self.db.broadcast_states, "user_id", unique=True)
+            ensure_index(self.db.target_groups, [("user_id", pymongo.ASCENDING), ("group_id", pymongo.ASCENDING)])
+            ensure_index(self.db.analytics, "user_id", unique=True)
+            ensure_index(self.db.broadcast_logs, "user_id")
+            ensure_index(self.db.broadcast_activity, "user_id")
+            ensure_index(self.db.temp_data, [("user_id", pymongo.ASCENDING), ("key", pymongo.ASCENDING)], unique=True)
+            ensure_index(self.db.logger_status, "user_id", unique=True)
+            ensure_index(self.db.logger_failures, "user_id")
+            ensure_index(self.db.auto_replies, "user_id", unique=True)
+            ensure_index(self.db.selected_broadcast_accounts, "user_id", unique=True)
+            ensure_index(self.db.user_ad_modes, "user_id", unique=True)
+        except Exception as e:
+            logger.warning(f"Error ensuring indexes: {e}")
+
     def _init_db(self):
         """Initialize MongoDB connection with exponential backoff retries and robust index handling."""
+        if not getattr(config, 'MONGO_URI', None):
+            logger.warning("No MONGO_URI in config. Using in-memory mongomock for testing.")
+            try:
+                import mongomock
+                self.client = mongomock.MongoClient()
+                self.db = self.client[config.DB_NAME]
+                self._create_indexes()
+                logger.info("mongomock initialized successfully for local testing")
+                return
+            except Exception as me:
+                logger.error(f"mongomock initialization failed: {me}")
+
         max_retries = 3
         retry_delay = 1
         for attempt in range(max_retries):
@@ -38,52 +100,7 @@ class EnhancedDatabaseManager:
                 self.client.admin.command('ping')
                 self.db = self.client[config.DB_NAME]
                 logger.info("MongoDB initialized successfully")
-
-                # Helper function to ensure index with specific options and retries
-                def ensure_index(collection, key, **kwargs):
-                    # Handle single or compound keys
-                    index_key = key if isinstance(key, list) else [(key, pymongo.ASCENDING)]
-                    # Generate default index name based on MongoDB convention
-                    index_name = "_".join(f"{k}_{v}" for k, v in index_key)
-                    index_retry_delay = 1
-                    for index_attempt in range(3):
-                        try:
-                            existing_indexes = collection.index_information()
-                            if index_name in existing_indexes:
-                                existing_unique = existing_indexes[index_name].get('unique', False)
-                                desired_unique = kwargs.get('unique', False)
-                                if existing_unique != desired_unique:
-                                    collection.drop_index(index_name)
-                                    logger.info(f"Dropped conflicting index {index_name} on {collection.name}")
-                                else:
-                                    logger.info(f"Index {index_name} on {collection.name} already exists with correct specs")
-                                    return
-                            collection.create_index(key, name=index_name, **kwargs)
-                            logger.info(f"Created index {index_name} on {collection.name}")
-                            return
-                        except OperationFailure as e:
-                            logger.error(f"Failed to create index {index_name} on {collection.name} (attempt {index_attempt + 1}): {e}")
-                            if index_attempt < 2:
-                                time.sleep(index_retry_delay)
-                                index_retry_delay *= 2
-                            else:
-                                raise
-
-                # Create indexes for efficient queries
-                ensure_index(self.db.users, "user_id", unique=True)
-                ensure_index(self.db.accounts, [("user_id", pymongo.ASCENDING), ("phone_number", pymongo.ASCENDING)])
-                ensure_index(self.db.ad_messages, "user_id")
-                ensure_index(self.db.ad_delays, "user_id", unique=True)
-                ensure_index(self.db.broadcast_states, "user_id", unique=True)
-                ensure_index(self.db.target_groups, [("user_id", pymongo.ASCENDING), ("group_id", pymongo.ASCENDING)])
-                ensure_index(self.db.analytics, "user_id", unique=True)
-                ensure_index(self.db.broadcast_logs, "user_id")
-                ensure_index(self.db.broadcast_activity, "user_id")
-                ensure_index(self.db.temp_data, [("user_id", pymongo.ASCENDING), ("key", pymongo.ASCENDING)], unique=True)
-                ensure_index(self.db.logger_status, "user_id", unique=True)
-                ensure_index(self.db.logger_failures, "user_id")
-                ensure_index(self.db.auto_replies, "user_id", unique=True)
-                ensure_index(self.db.selected_broadcast_accounts, "user_id", unique=True)
+                self._create_indexes()
                 return
             except ConnectionFailure as e:
                 logger.error(f"MongoDB connection attempt {attempt + 1}/{max_retries} failed: {e}")
@@ -91,8 +108,16 @@ class EnhancedDatabaseManager:
                     time.sleep(retry_delay)
                     retry_delay *= 2  # Exponential backoff
                 else:
-                    logger.error(f"Max retries reached for MongoDB connection. Check MONGO_URI in config.py.")
-                    raise
+                    logger.warning("Max retries reached for MongoDB. Falling back to mongomock for local testing...")
+                    try:
+                        import mongomock
+                        self.client = mongomock.MongoClient()
+                        self.db = self.client[config.DB_NAME]
+                        self._create_indexes()
+                        logger.info("Successfully fell back to mongomock for local testing.")
+                        return
+                    except Exception:
+                        raise
             except OperationFailure as e:
                 logger.error(f"Failed to initialize MongoDB: {e}. Ensure MONGO_URI credentials and database name are correct.")
                 if "bad auth" in str(e).lower():
@@ -304,48 +329,109 @@ class EnhancedDatabaseManager:
             logger.error(f"Failed to deactivate account {account_id}: {e}")
             raise
 
-    def get_user_ad_messages(self, user_id):
-        """Fetch user's ad messages."""
+    def update_account_bio(self, account_id, bio):
+        """Update stored bio for an account."""
         try:
-            return list(self.db.ad_messages.find({"user_id": user_id}, sort=[("created_at", -1)]))
+            self.db.accounts.update_one(
+                {"_id": ObjectId(account_id)},
+                {"$set": {"bio": bio, "bio_updated_at": datetime.now()}}
+            )
+            logger.info(f"Updated bio for account {account_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update bio for account {account_id}: {e}")
+            return False
+
+    def get_account(self, account_id):
+        """Get single account by ID."""
+        try:
+            return self.db.accounts.find_one({"_id": ObjectId(account_id)})
+        except Exception as e:
+            logger.error(f"Failed to get account {account_id}: {e}")
+            return None
+
+    def get_user_ad_messages(self, user_id):
+        """Fetch all user's ad messages sorted by creation time."""
+        try:
+            return list(self.db.ad_messages.find({"user_id": user_id}, sort=[("created_at", pymongo.ASCENDING)]))
         except Exception as e:
             logger.error(f"Failed to get ad messages for {user_id}: {e}")
             return []
 
-    def add_user_ad_message(self, user_id, message, created_at, photo_path=None, ad_type="text", entities=None, from_chat_id=None, message_id=None):
-        """Add an ad message for a user, with optional photo_path, ad_type, entities and forward origin.
-        ad_type can be: 'text', 'photo', 'both'
-        entities: list of dicts representing message formatting entities (for premium emoji etc.)
-        from_chat_id + message_id: origin of the message for Telethon forwarding (100% preserves premium emojis)
-        """
+    def get_ad_message(self, user_id, ad_id):
+        """Get single ad message by ID."""
         try:
-            update_data = {
-                "message": message,
-                "created_at": created_at,
+            from bson.objectid import ObjectId
+            oid = ObjectId(ad_id) if isinstance(ad_id, str) else ad_id
+            return self.db.ad_messages.find_one({"_id": oid, "user_id": user_id})
+        except Exception as e:
+            logger.error(f"Failed to get ad message {ad_id}: {e}")
+            return None
+
+    def add_user_ad_message(self, user_id, message, created_at=None, photo_path=None, ad_type="text", entities=None, from_chat_id=None, message_id=None):
+        """Add an ad message for a user. Supports unlimited ad messages."""
+        try:
+            doc = {
+                "user_id": user_id,
+                "message": message or "",
+                "created_at": created_at or datetime.now(),
                 "updated_at": datetime.now(),
                 "ad_type": ad_type,
+                "photo_path": photo_path,
                 "entities": entities or [],
                 "from_chat_id": int(from_chat_id) if from_chat_id is not None else None,
                 "message_id": int(message_id) if message_id is not None else None,
             }
-            if photo_path is not None:
-                update_data["photo_path"] = photo_path
-            else:
-                # If no photo_path provided, explicitly unset it in DB
-                self.db.ad_messages.update_one(
-                    {"user_id": user_id},
-                    {"$unset": {"photo_path": ""}},
-                    upsert=False
-                )
-
-            self.db.ad_messages.update_one(
-                {"user_id": user_id},
-                {"$set": update_data},
-                upsert=True
-            )
-            logger.info(f"Ad message added for user {user_id} (ad_type={ad_type}, photo_path={photo_path})")
+            res = self.db.ad_messages.insert_one(doc)
+            logger.info(f"Ad message added for user {user_id} (id={res.inserted_id}, ad_type={ad_type})")
+            return res.inserted_id
         except Exception as e:
             logger.error(f"Failed to add ad message for {user_id}: {e}")
+            raise
+
+    def delete_user_ad_message(self, user_id, ad_id):
+        """Delete a specific ad message."""
+        try:
+            from bson.objectid import ObjectId
+            oid = ObjectId(ad_id) if isinstance(ad_id, str) else ad_id
+            res = self.db.ad_messages.delete_one({"_id": oid, "user_id": user_id})
+            return res.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Failed to delete ad message {ad_id}: {e}")
+            return False
+
+    def clear_user_ad_messages(self, user_id):
+        """Clear all ad messages for user."""
+        try:
+            res = self.db.ad_messages.delete_many({"user_id": user_id})
+            return res.deleted_count
+        except Exception as e:
+            logger.error(f"Failed to clear ad messages for {user_id}: {e}")
+            return 0
+
+    def get_user_ad_mode(self, user_id):
+        """Get ad mode ('single' or 'rotation')."""
+        try:
+            doc = self.db.user_ad_modes.find_one({"user_id": user_id})
+            if doc and doc.get("mode"):
+                return doc.get("mode")
+            count = self.db.ad_messages.count_documents({"user_id": user_id})
+            return "rotation" if count > 1 else "single"
+        except Exception as e:
+            logger.error(f"Failed to get ad mode for {user_id}: {e}")
+            return "single"
+
+    def set_user_ad_mode(self, user_id, mode):
+        """Set ad mode ('single' or 'rotation')."""
+        try:
+            self.db.user_ad_modes.update_one(
+                {"user_id": user_id},
+                {"$set": {"mode": mode, "updated_at": datetime.now()}},
+                upsert=True
+            )
+            logger.info(f"Ad mode set to {mode} for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to set ad mode for {user_id}: {e}")
             raise
 
     def get_auto_reply(self, user_id):
