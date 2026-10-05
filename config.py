@@ -10,9 +10,9 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 LOGGER_BOT_TOKEN = os.getenv("LOGGER_BOT_TOKEN", "")
-BOT_USERNAME = "TecxoAdsBot"
-BOT_NAME = "Tecxo Ads 🚀"
-LOGGER_BOT_USERNAME = "AdbotLogv7bot"
+BOT_USERNAME = os.getenv("BOT_USERNAME", "gcfhgyhujikuyjgfdcgvhbnjkmbot")
+BOT_NAME = os.getenv("BOT_NAME", "adbot")
+LOGGER_BOT_USERNAME = os.getenv("LOGGER_BOT_USERNAME", "rftyghuijkoijuytfrghjklkbot")
 
 # Admin Settings
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -47,7 +47,7 @@ GUIDE_URL = "https://t.me/TecxoChat"
 PRIVATE_CHANNEL_INVITE = "https://t.me/TecxoChat"
 
 # Encryption Key
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "ncWfmLS_S2IjSjW3HSK4FdEBkdyVImNPR-kcmRY9r14=")
 
 # Database Configuration
 MONGO_URI = os.getenv("MONGO_URI", "")

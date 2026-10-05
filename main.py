@@ -20,12 +20,18 @@ import random
 import string
 import re
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, functions, types, events
 from telethon.sessions import StringSession
-from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.account import UpdateProfileRequest, UpdateNotifySettingsRequest
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions import chatlists, channels, messages
-from telethon.tl.types import chatlists as chatlist_types, InputChatlistDialogFilter
+from telethon.tl.types import (
+    chatlists as chatlist_types,
+    InputChatlistDialogFilter,
+    InputNotifyPeer,
+    InputPeerNotifySettings,
+)
 from telethon.tl.types import (
     MessageEntityCustomEmoji,
     MessageEntityBold,
@@ -169,11 +175,23 @@ logger = logging.getLogger(__name__)
 
 print("Tecxo Bot Free Version Started. 🚀")
 
-# Initialize encryption key with persistence
+# Initialize encryption key with persistence across containers
 ENCRYPTION_KEY = getattr(config, 'ENCRYPTION_KEY', None)
+if not ENCRYPTION_KEY and getattr(config, 'MONGO_URI', None):
+    try:
+        from pymongo import MongoClient
+        _client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=4000)
+        _db = _client[getattr(config, 'DB_NAME', 'adsbot_db')]
+        _doc = _db.settings.find_one({"_id": "app_encryption_key"})
+        if _doc and _doc.get("key"):
+            ENCRYPTION_KEY = _doc["key"]
+            logger.info("Retrieved ENCRYPTION_KEY from MongoDB settings.")
+    except Exception as e:
+        logger.warning(f"Could not load ENCRYPTION_KEY from MongoDB: {e}")
+
 KEY_FILE = 'encryption.key'
 if not ENCRYPTION_KEY:
-    logger.warning("No ENCRYPTION_KEY in config. Loading or generating from file.")
+    logger.warning("No ENCRYPTION_KEY in config or DB. Loading or generating from file.")
     if os.path.exists(KEY_FILE):
         with open(KEY_FILE, 'r') as f:
             ENCRYPTION_KEY = f.read().strip()
@@ -183,9 +201,25 @@ if not ENCRYPTION_KEY:
             f.write(ENCRYPTION_KEY)
         logger.info("Generated and saved new encryption key to encryption.key")
 else:
-    with open(KEY_FILE, 'w') as f:
-        f.write(ENCRYPTION_KEY)
-    logger.info("Using ENCRYPTION_KEY from config and saved to file.")
+    try:
+        with open(KEY_FILE, 'w') as f:
+            f.write(ENCRYPTION_KEY)
+    except Exception:
+        pass
+    logger.info("Using ENCRYPTION_KEY.")
+
+if ENCRYPTION_KEY and getattr(config, 'MONGO_URI', None):
+    try:
+        from pymongo import MongoClient
+        _client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=4000)
+        _db = _client[getattr(config, 'DB_NAME', 'adsbot_db')]
+        _db.settings.update_one(
+            {"_id": "app_encryption_key"},
+            {"$set": {"key": ENCRYPTION_KEY, "updated_at": datetime.now()}},
+            upsert=True
+        )
+    except Exception as e:
+        logger.warning(f"Could not persist ENCRYPTION_KEY to MongoDB: {e}")
 
 cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 
@@ -1058,7 +1092,9 @@ async def otp_callback(client, cb):
                 await tg.connect()
                 await tg.sign_in(phone, code=otp, phone_code_hash=phone_code_hash)
 
-                session_encrypted = cipher_suite.encrypt(session_str.encode()).decode()
+                saved_session = tg.session.save()
+                await tg.disconnect()
+                session_encrypted = cipher_suite.encrypt(saved_session.encode()).decode()
                 db.add_user_account(uid, phone, session_encrypted)
 
                 await cb.message.edit_caption(
@@ -1073,9 +1109,11 @@ async def otp_callback(client, cb):
                 db.set_temp_data(uid, None)
                 break
             except SessionPasswordNeededError:
+                saved_session = tg.session.save()
+                await tg.disconnect()
                 temp_dict_2fa = {
                     "phone": phone,
-                    "session_str": session_str
+                    "session_str": saved_session or session_str
                 }
                 temp_json_2fa = json.dumps(temp_dict_2fa)
                 temp_encrypted_2fa = cipher_suite.encrypt(temp_json_2fa.encode()).decode()
@@ -1688,11 +1726,29 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
                 fail_list.append(f"• <code>{phone}</code>: ❌ Session unauthorized (deactivated)")
                 continue
 
-            await tg_client(UpdateProfileRequest(about=new_bio))
+            me = await tg_client.get_me()
+            await tg_client(UpdateProfileRequest(
+                first_name=me.first_name or "",
+                last_name=me.last_name or "",
+                about=new_bio
+            ))
+
+            verified_bio = new_bio
+            try:
+                full = await tg_client(GetFullUserRequest('me'))
+                verified_bio = getattr(full.full_user, 'about', '') or ""
+            except Exception:
+                pass
+
             db.update_account_bio(acc_id, new_bio)
             await tg_client.disconnect()
-            success_list.append(f"• <code>{phone}</code>: ✅ Bio updated")
-            logger.info(f"Bio updated successfully for {phone}")
+
+            if verified_bio == new_bio or not new_bio:
+                success_list.append(f"• <code>{phone}</code>: ✅ Bio updated & verified")
+                logger.info(f"Bio updated & verified for {phone}: {new_bio}")
+            else:
+                success_list.append(f"• <code>{phone}</code>: ⚠️ Saved in DB (Telegram bio: '{verified_bio[:30]}')")
+                logger.warning(f"Bio discrepancy for {phone}: expected '{new_bio}', got '{verified_bio}'")
         except FloodWaitError as e:
             fail_list.append(f"• <code>{phone}</code>: ⏳ FloodWait ({e.seconds}s)")
             logger.warning(f"FloodWait updating bio for {phone}: {e.seconds}s")
@@ -1984,12 +2040,19 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                                 slug=folder_slug,
                                 peers=input_peers
                             ))
-                            success_list.append(f"• <code>{phone}</code>: ✅ Joined {len(input_peers)} groups from folder")
+                            mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
+                            for p in input_peers:
+                                try:
+                                    await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p), settings=mute_settings))
+                                except Exception:
+                                    pass
+                            success_list.append(f"• <code>{phone}</code>: ✅ Joined & muted {len(input_peers)} groups 🔕")
                         else:
                             success_list.append(f"• <code>{phone}</code>: ℹ️ Folder empty or already joined")
 
                     elif isinstance(invite, chatlist_types.ChatlistInviteAlready):
                         missing = getattr(invite, 'missing_peers', [])
+                        mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
                         if missing:
                             input_peers = []
                             for p in missing:
@@ -2002,11 +2065,24 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                                     chatlist=InputChatlistDialogFilter(filter_id=invite.filter_id),
                                     peers=input_peers
                                 ))
-                                success_list.append(f"• <code>{phone}</code>: ✅ Joined {len(input_peers)} new groups")
+                                for p in input_peers:
+                                    try:
+                                        await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p), settings=mute_settings))
+                                    except Exception:
+                                        pass
+                                success_list.append(f"• <code>{phone}</code>: ✅ Joined & muted {len(input_peers)} new groups 🔕")
                             else:
                                 success_list.append(f"• <code>{phone}</code>: ✅ Already in all groups")
                         else:
-                            success_list.append(f"• <code>{phone}</code>: ✅ Already joined all groups in folder")
+                            # Mute already joined folder chats
+                            all_chats = getattr(invite, 'chats', [])
+                            for ch in all_chats:
+                                try:
+                                    p = await tg_client.get_input_entity(ch)
+                                    await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p), settings=mute_settings))
+                                except Exception:
+                                    pass
+                            success_list.append(f"• <code>{phone}</code>: ✅ In all folder groups & muted all 🔕")
                     else:
                         success_list.append(f"• <code>{phone}</code>: ℹ️ Processed folder")
 
@@ -2021,12 +2097,18 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
 
             else:
                 joined = 0
+                mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
                 for h in invite_hashes:
                     try:
                         res = await tg_client(functions.messages.ImportChatInviteRequest(hash=h))
                         chats = getattr(res, 'chats', [])
                         for c in chats:
                             db.add_target_group(uid, c.id, getattr(c, 'title', str(c.id)))
+                            try:
+                                inp = await tg_client.get_input_entity(c)
+                                await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
+                            except Exception:
+                                pass
                         joined += 1
                         await asyncio.sleep(1)
                     except UserAlreadyParticipantError:
@@ -2039,6 +2121,11 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                         entity = await tg_client.get_entity(u)
                         await tg_client(functions.channels.JoinChannelRequest(channel=entity))
                         db.add_target_group(uid, entity.id, getattr(entity, 'title', u))
+                        try:
+                            inp = await tg_client.get_input_entity(entity)
+                            await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
+                        except Exception:
+                            pass
                         joined += 1
                         await asyncio.sleep(1)
                     except UserAlreadyParticipantError:
@@ -2510,20 +2597,32 @@ async def start_broadcast(client, cb):
 
         if not db.get_logger_status(uid):
             try:
-                await cb.message.edit_caption(
-                    caption="<b>⚠️ Logger bot not started yet!</b>\n\n"
-                            f"Please start @{config.LOGGER_BOT_USERNAME.lstrip('@')} to receive Advertising logs.\n"
-                            "<i>After starting, return here to begin Advertising.</i>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb([
-                        [InlineKeyboardButton("Start Logger Bot 📩", url=f"https://t.me/{config.LOGGER_BOT_USERNAME.lstrip('@')}")],
-                        [InlineKeyboardButton("Back", callback_data="menu_main")]
-                    ])
-                )
-            except Exception as e:
-                logger.error(f"Failed to edit logger bot message for {uid}: {e}")
-                await cb.answer("╰_╯Error: Please try again.", show_alert=True)
-            return
+                await logger_client.resolve_peer(uid)
+                db.set_logger_status(uid, is_active=True)
+            except Exception:
+                pass
+
+        if not db.get_logger_status(uid):
+            if is_owner(uid):
+                db.set_logger_status(uid, is_active=True)
+            else:
+                try:
+                    logger_username = config.LOGGER_BOT_USERNAME.lstrip('@')
+                    await cb.message.edit_caption(
+                        caption="<b>⚠️ Logger bot not started yet!</b>\n\n"
+                                f"Please start @{logger_username} to receive Advertising logs.\n\n"
+                                "<i>After starting the logger bot, click 'I Started It' below!</i>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=kb([
+                            [InlineKeyboardButton("Start Logger Bot 📩", url=f"https://t.me/{logger_username}")],
+                            [InlineKeyboardButton("✅ I Started It / Continue", callback_data="confirm_logger_start")],
+                            [InlineKeyboardButton("Back 🔙", callback_data="menu_main")]
+                        ])
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to edit logger bot message for {uid}: {e}")
+                    await cb.answer("╰_╯Error: Please try again.", show_alert=True)
+                return
 
         # Load previously-selected accounts (defaults to empty = none pre-selected)
         prev_selected = db.get_selected_broadcast_accounts(uid) or []
@@ -2545,6 +2644,19 @@ async def start_broadcast(client, cb):
     except Exception as e:
         logger.error(f"Error in start_broadcast for {uid}: {e}")
         await cb.answer("Error. Try again.", show_alert=True)
+
+
+@pyro.on_callback_query(filters.regex("^confirm_logger_start$"))
+async def confirm_logger_start_cb(client, cb):
+    """Callback when user confirms they started the logger bot."""
+    uid = cb.from_user.id
+    try:
+        await logger_client.resolve_peer(uid)
+    except Exception:
+        pass
+    db.set_logger_status(uid, is_active=True)
+    await cb.answer("Logger status updated! Proceeding... ✅", show_alert=False)
+    await start_broadcast(client, cb)
 
 
 @pyro.on_callback_query(filters.regex("^toggle_bcast_acc_"))
@@ -3381,6 +3493,7 @@ async def handle_text_message(client, m):
                 db.set_user_ad_mode(uid, "single")
                 db.set_user_state(uid, "")
                 db.set_user_temp_data(uid, "new_ad_type", None)
+                total_ads = 1
                 entity_count = len(msg_entities)
                 logger.info(f"Single ad text set for {uid}: {len(text)} chars, {entity_count} entities, msg_id={message_id}")
                 await m.reply(
@@ -3698,7 +3811,8 @@ async def _handle_telethon_password(uid, text, m):
     try:
         await tg.connect()
         await tg.sign_in(password=text)
-        session_encrypted = cipher_suite.encrypt(session_str.encode()).decode()
+        saved_session = tg.session.save()
+        session_encrypted = cipher_suite.encrypt(saved_session.encode()).decode()
         db.add_user_account(uid, phone, session_encrypted)
         await m.reply(
             f"<blockquote><b>╰_╯Account added!✅ </b></blockquote>\n\n"
@@ -3985,6 +4099,17 @@ async def handle_document_message(client, m):
 async def main():
     await pyro.start()
     await logger_client.start()
+    try:
+        me = await pyro.get_me()
+        if me and me.username:
+            config.BOT_USERNAME = me.username
+            logger.info(f"Main bot connected: @{me.username} (ID: {me.id})")
+        logger_me = await logger_client.get_me()
+        if logger_me and logger_me.username:
+            config.LOGGER_BOT_USERNAME = logger_me.username
+            logger.info(f"Logger bot connected: @{logger_me.username} (ID: {logger_me.id})")
+    except Exception as e:
+        logger.warning(f"Failed to fetch bot usernames dynamically: {e}")
     try:
         await idle()
     except KeyboardInterrupt:
