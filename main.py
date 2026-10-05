@@ -167,13 +167,13 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/TecxoAds.log', encoding='utf-8'),
+        logging.FileHandler('logs/adbot.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-print("Tecxo Bot Free Version Started. 🚀")
+print("Adbot Started. 🚀")
 
 # Initialize encryption key with persistence across containers
 ENCRYPTION_KEY = getattr(config, 'ENCRYPTION_KEY', None)
@@ -228,7 +228,7 @@ try:
     db = EnhancedDatabaseManager()
 except Exception as e:
     logger.error(f"Failed to initialize database: {e}. Exiting.")
-    print("Bot failed to start due to database error. Check logs/TecxoAds.log for details.")
+    print("Bot failed to start due to database error. Check logs/adbot.log for details.")
     exit(1)
 
 # Admin check
@@ -246,7 +246,7 @@ def kb(rows):
     return InlineKeyboardMarkup(rows)
 
 # Initialize Pyrogram clients
-pyro = PyroClient("TecxoAds", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
+pyro = PyroClient("adbot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
 logger_client = PyroClient("logger_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.LOGGER_BOT_TOKEN)
 
 # In-memory storage for broadcast tasks
@@ -1732,8 +1732,16 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
     for idx, acc in enumerate(targets, 1):
         phone = acc.get('phone_number', 'Unknown')
         acc_id = acc['_id']
+        tg_client = None
         try:
-            session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
+            # Decrypt session string
+            try:
+                session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
+            except Exception as dec_err:
+                fail_list.append(f"• <code>{phone}</code>: ❌ Decrypt error: {str(dec_err)[:60]}")
+                logger.error(f"Bio: failed to decrypt session for {phone}: {dec_err}")
+                continue
+
             tg_client = TelegramClient(
                 StringSession(session_str),
                 config.API_ID,
@@ -1758,18 +1766,19 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
             verified_bio = new_bio
             try:
                 full = await tg_client(GetFullUserRequest('me'))
-                verified_bio = getattr(full.full_user, 'about', '') or ""
+                verified_bio = (getattr(full.full_user, 'about', '') or "").strip()
             except Exception:
                 pass
 
             db.update_account_bio(acc_id, new_bio)
             await tg_client.disconnect()
+            tg_client = None
 
-            if verified_bio == new_bio or not new_bio:
+            if verified_bio == new_bio.strip() or (not new_bio and not verified_bio):
                 success_list.append(f"• <code>{phone}</code>: ✅ Bio updated & verified")
                 logger.info(f"Bio updated & verified for {phone}: {new_bio}")
             else:
-                success_list.append(f"• <code>{phone}</code>: ⚠️ Saved in DB (Telegram bio: '{verified_bio[:30]}')")
+                success_list.append(f"• <code>{phone}</code>: ⚠️ Saved (Telegram got: '{verified_bio[:30]}')")
                 logger.warning(f"Bio discrepancy for {phone}: expected '{new_bio}', got '{verified_bio}'")
         except FloodWaitError as e:
             fail_list.append(f"• <code>{phone}</code>: ⏳ FloodWait ({e.seconds}s)")
@@ -1777,11 +1786,18 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
         except AboutTooLongError:
             fail_list.append(f"• <code>{phone}</code>: ❌ Exceeds 70-character limit")
         except Exception as e:
+            import traceback
             err_msg = str(e)
             if "about too long" in err_msg.lower():
                 err_msg = "Exceeds 70-character limit"
-            fail_list.append(f"• <code>{phone}</code>: ❌ {err_msg}")
-            logger.error(f"Failed to update bio for {phone}: {e}")
+            fail_list.append(f"• <code>{phone}</code>: ❌ {err_msg[:80]}")
+            logger.error(f"Failed to update bio for {phone}: {traceback.format_exc()}")
+        finally:
+            if tg_client:
+                try:
+                    await tg_client.disconnect()
+                except Exception:
+                    pass
 
         if len(targets) > 1 and idx % 2 == 0:
             try:
@@ -2860,7 +2876,7 @@ async def analytics(client, cb):
     logger_failures = len(db.get_logger_failures(uid))
     
     analytics_text = (
-        f"<blockquote><b>╰_╯@Tecxo ANALYTICS</b></blockquote>\n\n"
+        f"<blockquote><b>╰_╯ ANALYTICS</b></blockquote>\n\n"
         f"<u>Broadcast Cycles Completed:</u> <code>{user_stats.get('total_cycles', 0)}</code>\n"
         f"<b>Messages Sent:</b> <i>{user_stats.get('total_sent', 0)}</i>\n"
         f"<u>Failed Sends:</u> <code>{user_stats.get('total_failed', 0)}</code>\n"
@@ -2918,7 +2934,7 @@ async def admin_stats(client, m):
         stats = db.get_admin_stats()
         
         stats_text = (
-            f"<blockquote><b>╰_╯ Tecxo Ads ADMIN DASHBOARD </b></blockquote>\n\n"
+            f"<blockquote><b>╰_╯ ADMIN DASHBOARD </b></blockquote>\n\n"
             f"<u>Report Date:</u> <i>{datetime.now().strftime('%d/%m/%y • %I:%M %p')}</i>\n\n"
             "<b>USER STATISTICS</b>\n"
             f"• <u>Total Users:</u> <code>{stats.get('total_users', 0)}</code>\n"
@@ -2957,7 +2973,7 @@ async def admin_broadcast(client, m):
     
     total_users = len(all_users)
     status_msg = await m.reply(
-        """<blockquote><b>📢 Tecxo ADMIN BROADCAST</b></blockquote>\n\n"""
+        """<blockquote><b>📢 ADMIN BROADCAST</b></blockquote>\n\n"""
         "<u>Status: Initializing...</u>",
         parse_mode=ParseMode.HTML
     )
@@ -3017,7 +3033,7 @@ async def admin_broadcast(client, m):
         if (sent_count + failed_count) % 10 == 0 or (sent_count + failed_count) == total_users:
             try:
                 await status_msg.edit_text(
-                    f"""<blockquote><b>📢 Tecxo ADMIN BROADCAST</b></blockquote>\n\n"""
+                    f"""<blockquote><b>📢 ADMIN BROADCAST</b></blockquote>\n\n"""
                     f"<u>Status: In Progress...</u> \n"
                     f"<b>Sent:</b> <code>{sent_count}/{total_users}</code>\n"
                     f"<i>Failed:</i> <u>{failed_count}</u>\n"
@@ -3029,7 +3045,7 @@ async def admin_broadcast(client, m):
         await asyncio.sleep(0.5)
     
     await status_msg.edit_text(
-        f"""<blockquote><b>✅ Tecxo ADMIN BROADCAST COMPLETED </b></blockquote>\n\n"""
+        f"""<blockquote><b>✅ ADMIN BROADCAST COMPLETED </b></blockquote>\n\n"""
         f"<u>Sent:</u> <code>{sent_count}/{total_users}</code>\n"
         f"<b>Failed:</b> <i>{failed_count}</i> ⚠️\n"
         f"<blockquote>Success Rate: {generate_progress_bar(sent_count, total_users)} 💹</blockquote>",
@@ -3063,7 +3079,7 @@ async def user_info(client, m):
     accounts_count = db.get_user_accounts_count(uid)
     
     status_text = (
-        f"<blockquote><b>╰_╯ Tecxo FREE Ads bot</b></blockquote>\n\n"
+        f"<blockquote><b>╰_╯ Ads Bot</b></blockquote>\n\n"
         f"<u>User ID:</u> <code>{uid}</code>\n"
         f"<b>Username:</b> <i>@{user.get('username', 'N/A')}</i>\n"
         "<blockquote><b>Status: FREE USER </b></blockquote>\n"
@@ -3105,7 +3121,7 @@ async def start(client, m):
             try:
                 await m.reply_photo(
                     photo=config.FORCE_JOIN_IMAGE,
-                    caption="""<blockquote><b>╰_╯WELCOME TO @TECXO FREE ADS BOT</b></blockquote>\n\n"""
+                    caption="""<blockquote><b>╰_╯ WELCOME TO YOUR ADS BOT</b></blockquote>\n\n"""
                             """To unlock the full <b>Theodron</b> experience, please join our official channel and group first!\n\n"""
                             """<i>Tip: Click the buttons below to join both. After joining, click 'Try Again' to proceed.</i>\n\n"""
                             """Your <i>Free premium automation journey</i> starts here""",

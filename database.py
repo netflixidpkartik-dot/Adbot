@@ -767,7 +767,8 @@ class EnhancedDatabaseManager:
         try:
             self.db.users.update_one(
                 {"user_id": user_id},
-                {"$set": {"state": state, "updated_at": datetime.now()}}
+                {"$set": {"state": state, "updated_at": datetime.now()}},
+                upsert=True
             )
             logger.info(f"Set user state for {user_id}: {state}")
         except Exception as e:
