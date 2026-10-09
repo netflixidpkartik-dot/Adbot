@@ -695,6 +695,7 @@ async def run_broadcast(client, uid, account_ids=None):
                     config.API_HASH,
                     connection_retries=3,
                     retry_delay=5,
+                    receive_updates=False,
                 )
                 await tg_client.connect()
 
@@ -707,15 +708,16 @@ async def run_broadcast(client, uid, account_ids=None):
                     continue
 
                 # Auto-join the ad source channel if not already in it
-                try:
-                    await tg_client(functions.channels.JoinChannelRequest(config.AD_SOURCE_CHANNEL))
-                    logger.info(f"Account {acc['phone_number']} joined ad source channel")
-                except Exception as e:
-                    logger.info(f"Account {acc['phone_number']} already in channel or join skipped: {e}")
+                if config.AD_SOURCE_CHANNEL:
+                    try:
+                        await tg_client(functions.channels.JoinChannelRequest(config.AD_SOURCE_CHANNEL))
+                        logger.info(f"Account {acc['phone_number']} joined ad source channel")
+                    except Exception as e:
+                        logger.info(f"Account {acc['phone_number']} already in channel or join skipped: {e}")
 
-                # Fetch ALL groups, matching both positive and negative Telegram group IDs
+                # Fetch active groups (limit=100 for fast startup)
                 cached_groups = []
-                async for dialog in tg_client.iter_dialogs(limit=None):
+                async for dialog in tg_client.iter_dialogs(limit=100):
                     if dialog.is_group:
                         norm_id = normalize_tg_id(dialog.id)
                         if normalized_group_ids is None or norm_id in normalized_group_ids or dialog.id in (group_ids or []):
@@ -724,10 +726,10 @@ async def run_broadcast(client, uid, account_ids=None):
                                 continue
                             cached_groups.append((dialog.id, dialog.name))
 
-                # Safety fallback: if target_groups had mismatch, use all active groups
+                # Safety fallback: if target_groups had mismatch, use all active group dialogs
                 if not cached_groups:
-                    logger.info(f"No groups matched filter for {acc['phone_number']}, falling back to all active group dialogs")
-                    async for dialog in tg_client.iter_dialogs(limit=None):
+                    logger.info(f"No groups matched filter for {acc['phone_number']}, falling back to active group dialogs")
+                    async for dialog in tg_client.iter_dialogs(limit=100):
                         if dialog.is_group:
                             norm_id = normalize_tg_id(dialog.id)
                             if dialog.id in skip_group_ids or norm_id in skip_group_ids:
@@ -740,9 +742,9 @@ async def run_broadcast(client, uid, account_ids=None):
 
                 logger.info(f"Account {acc['phone_number']} ready — {len(cached_groups)} groups")
 
-                # Stagger: wait between connecting each account
+                # Fast stagger: wait 0.5s between connecting each account
                 if i < len(accounts) - 1:
-                    await asyncio.sleep(random.uniform(5, 12))
+                    await asyncio.sleep(0.5)
 
             except Exception as e:
                 logger.error(f"Failed to start client for {acc['phone_number']}: {e}")
@@ -797,9 +799,32 @@ async def run_broadcast(client, uid, account_ids=None):
 
                 num_ads = len(user_ads)
 
-                # Re-shuffle group order every cycle for each account
-                for acc_id in group_cache:
-                    random.shuffle(group_cache[acc_id])
+                # ── Group Partitioning to Prevent Repeated Actions ─────────────
+                # 1. Build list of all distinct target groups across active accounts
+                unique_groups_dict = {}
+                for acc_id, grps in group_cache.items():
+                    if acc_id not in banned_accounts:
+                        for gid, gname in grps:
+                            unique_groups_dict[gid] = gname
+
+                all_unique_groups = list(unique_groups_dict.items())
+                random.shuffle(all_unique_groups)
+
+                active_acc_keys = [aid for aid in clients.keys() if aid not in banned_accounts]
+                num_active_accs = len(active_acc_keys)
+
+                # 2. Assign each group to EXACTLY ONE account for this cycle (zero duplicate spam!)
+                assigned_groups = {aid: [] for aid in active_acc_keys}
+                if num_active_accs > 0:
+                    for idx, (gid, gname) in enumerate(all_unique_groups):
+                        candidates = [aid for aid in active_acc_keys if any(g[0] == gid for g in group_cache.get(aid, []))]
+                        if candidates:
+                            assigned_aid = candidates[idx % len(candidates)]
+                        else:
+                            assigned_aid = active_acc_keys[idx % num_active_accs]
+                        assigned_groups[assigned_aid].append((gid, gname))
+
+                cycle_posted_gids = set()
 
                 # ── Worker function for simultaneous account broadcasting ──────
                 async def broadcast_worker(acc_id, tg_client, session_str, phone, start_stagger, acc_index):
@@ -814,55 +839,20 @@ async def run_broadcast(client, uid, account_ids=None):
                                 await asyncio.sleep(chunk)
                                 elapsed_stagger += chunk
 
-                        acc_groups = list(group_cache.get(acc_id, []))
+                        acc_groups = list(assigned_groups.get(acc_id, []))
                         random.shuffle(acc_groups)
-                        retry_queue = []
-                        retries_per_group = {}
 
-                        # Base ad index for this account in this cycle:
-                        # Cycle 0: Acc 0 -> Ad 0, Acc 1 -> Ad 1, Acc 2 -> Ad 2...
-                        # Cycle 1: Acc 0 -> Ad 1, Acc 1 -> Ad 2, Acc 2 -> Ad 3...
-                        base_ad_idx = (acc_index + cycle_count) % num_ads
-
-                        while acc_groups or retry_queue:
+                        for group_idx, (gid, group_name) in enumerate(acc_groups):
                             if not db.get_broadcast_state(uid).get("running", False):
                                 return
 
-                            if not acc_groups:
-                                acc_groups = retry_queue
-                                retry_queue = []
-                                await asyncio.sleep(10)
-                                if not acc_groups:
-                                    break
-
-                            gid, group_name = acc_groups.pop(0)
-
-                            # ── Check anti-spam group cooldown & anti-collision ad ──
-                            should_skip_for_now = False
-                            chosen_ad_idx = base_ad_idx
-                            chosen_ad_doc = None
-
                             async with group_lock:
-                                last_sent = group_last_posted.get(gid, 0)
-                                if (time.time() - last_sent) < GROUP_COOLDOWN:
-                                    should_skip_for_now = True
-                                else:
-                                    # Anti-collision: never send identical ad consecutively in the same group
-                                    if num_ads > 1:
-                                        last_ad = group_last_ad_index.get(gid)
-                                        if last_ad == chosen_ad_idx:
-                                            chosen_ad_idx = (chosen_ad_idx + 1) % num_ads
+                                if gid in cycle_posted_gids:
+                                    continue  # Already sent by another account in this cycle!
 
-                                    chosen_ad_doc = user_ads[chosen_ad_idx]
-                                    group_last_posted[gid] = time.time()
-                                    group_last_ad_index[gid] = chosen_ad_idx
-
-                            if should_skip_for_now:
-                                current_retries = retries_per_group.get(gid, 0)
-                                if current_retries < 3:
-                                    retries_per_group[gid] = current_retries + 1
-                                    retry_queue.append((gid, group_name))
-                                continue
+                            # Base ad index: rotate across accounts and groups
+                            chosen_ad_idx = (acc_index + cycle_count + group_idx) % num_ads
+                            chosen_ad_doc = user_ads[chosen_ad_idx]
 
                             # Auto-reconnect if client dropped
                             if not tg_client.is_connected():
@@ -878,13 +868,14 @@ async def run_broadcast(client, uid, account_ids=None):
 
                                 async with stats_lock:
                                     sent_count += 1
+                                    cycle_posted_gids.add(gid)
                                     db.increment_broadcast_stats(uid, True)
                                 ad_num_display = chosen_ad_idx + 1
                                 logger.info(f"Sent Ad #{ad_num_display} to {group_name} ({gid}) via {phone}")
                                 await send_dm_log(uid, f"<b>✅ Sent Ad #{ad_num_display} to {group_name}</b> via {phone}")
 
                             except FloodWaitError as e:
-                                wait = min(e.seconds, 300)
+                                wait = min(e.seconds, 120)
                                 logger.warning(f"FloodWait {e.seconds}s for {phone} in {gid}")
                                 await send_dm_log(uid, f"<b>⚠️ Flood wait {e.seconds}s — {group_name}</b> via {phone}")
                                 async with stats_lock:
@@ -926,8 +917,8 @@ async def run_broadcast(client, uid, account_ids=None):
                                     error_summary.append(f"{group_name}: {err_str}")
                                     await send_dm_log(uid, f"<b>❌ Failed to send to {group_name}:</b> {err_str}")
 
-                            # Per-account delay between its own sends (45–75 seconds)
-                            per_acc_delay = random.uniform(45, 75)
+                            # Safe per-account delay between its own sends (30–45 seconds)
+                            per_acc_delay = random.uniform(30, 45)
                             elapsed_wait = 0.0
                             while elapsed_wait < per_acc_delay:
                                 if not db.get_broadcast_state(uid).get("running", False):
@@ -948,7 +939,7 @@ async def run_broadcast(client, uid, account_ids=None):
                     if acc_id in banned_accounts or acc_id not in clients:
                         continue
                     tg_client, session_str, phone = clients[acc_id]
-                    stagger = stagger_idx * random.uniform(5, 8)
+                    stagger = stagger_idx * random.uniform(2, 4)
                     worker_tasks.append(
                         asyncio.create_task(
                             broadcast_worker(acc_id, tg_client, session_str, phone, stagger, stagger_idx)
@@ -1459,74 +1450,101 @@ async def host_by_string(client, cb):
 
 @pyro.on_callback_query(filters.regex("view_accounts"))
 async def view_accounts(client, cb):
-    uid = cb.from_user.id
-    accounts = db.get_user_accounts(uid)
-    if not accounts:
-        await cb.message.edit_caption(
-            caption="""<blockquote><b>╰_╯NO ACCOUNTS HOSTED</b></blockquote>\n\n"""
-                    """Add an account to start broadcasting!""",
-            reply_markup=kb([[InlineKeyboardButton("Add Account 📱", callback_data="host_account"),
-                            InlineKeyboardButton("Back 🔙", callback_data="menu_main")]]),
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    caption = "<blockquote><b>╰_╯HOSTED ACCOUNTS</b></blockquote>\n\n"
-    buttons = []
-    for i, acc in enumerate(accounts, 1):
-        status = "Active ✅" if acc['is_active'] else "Inactive ❌"
-        caption += f"{i}. <code>{acc['phone_number']}</code> - <i>{status}</i>\n"
+    try:
+        uid = cb.from_user.id
+        accounts = db.get_user_accounts(uid)
+        if not accounts:
+            try:
+                await cb.message.edit_caption(
+                    caption="""<blockquote><b>╰_╯NO ACCOUNTS HOSTED</b></blockquote>\n\n"""
+                            """Add an account to start broadcasting!""",
+                    reply_markup=kb([[InlineKeyboardButton("Add Account 📱", callback_data="host_account"),
+                                    InlineKeyboardButton("Back 🔙", callback_data="menu_main")]]),
+                    parse_mode=ParseMode.HTML
+                )
+            except MessageNotModified:
+                pass
+            await cb.answer()
+            return
+        
+        caption = "<blockquote><b>╰_╯HOSTED ACCOUNTS</b></blockquote>\n\n"
+        buttons = []
+        for i, acc in enumerate(accounts, 1):
+            status = "Active ✅" if acc['is_active'] else "Inactive ❌"
+            caption += f"{i}. <code>{acc['phone_number']}</code> - <i>{status}</i>\n"
+            buttons.append([
+                InlineKeyboardButton(f"{acc['phone_number']} ({status})", callback_data=f"view_acc_{acc['_id']}"),
+                InlineKeyboardButton("Delete", callback_data=f"delete_acc_{acc['_id']}")
+            ])
+        
+        caption += "\n<blockquote>╰_╯Choose an action:</blockquote>"
+        buttons.append([InlineKeyboardButton("Add Account ➕", callback_data="host_account")])
         buttons.append([
-            InlineKeyboardButton(f"{acc['phone_number']} ({status})", callback_data=f"view_acc_{acc['_id']}"),
-            InlineKeyboardButton("Delete", callback_data=f"delete_acc_{acc['_id']}")
+            InlineKeyboardButton("✏️ Change Bio (All)", callback_data="edit_bio_all"),
+            InlineKeyboardButton("📁 Join Folder (All)", callback_data="join_folder_all")
         ])
-    
-    caption += "\n<blockquote>╰_╯Choose an action:</blockquote>"
-    buttons.append([InlineKeyboardButton("Add Account ➕", callback_data="host_account")])
-    buttons.append([
-        InlineKeyboardButton("✏️ Change Bio (All)", callback_data="edit_bio_all"),
-        InlineKeyboardButton("📁 Join Folder (All)", callback_data="join_folder_all")
-    ])
-    buttons.append([InlineKeyboardButton("Back 🔙", callback_data="menu_main")])
-    
-    await cb.message.edit_caption(
-        caption=caption,
-        reply_markup=kb(buttons),
-        parse_mode=ParseMode.HTML
-    )
+        buttons.append([InlineKeyboardButton("Back 🔙", callback_data="menu_main")])
+        
+        try:
+            await cb.message.edit_caption(
+                caption=caption,
+                reply_markup=kb(buttons),
+                parse_mode=ParseMode.HTML
+            )
+        except MessageNotModified:
+            pass
+        await cb.answer()
+    except Exception as e:
+        logger.error(f"Error in view_accounts: {e}")
+        try:
+            await cb.answer()
+        except Exception:
+            pass
 
 @pyro.on_callback_query(filters.regex("delete_accounts"))
 async def delete_accounts(client, cb):
-    uid = cb.from_user.id
-    accounts = db.get_user_accounts(uid)
-    if not accounts:
-        await cb.message.edit_caption(
-            caption="""<blockquote><b>╰_╯NO ACCOUNTS TO DELETE</b></blockquote>\n\n"""
-                    """Add an account to start Advertising!""",
-            reply_markup=kb([[InlineKeyboardButton("Add Account", callback_data="host_account"),
-                            InlineKeyboardButton("Back", callback_data="menu_main")]]),
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    caption = "<blockquote><b>╰_╯ DELETE ACCOUNTS</b></blockquote>\n\n"
-    buttons = []
-    for i, acc in enumerate(accounts, 1):
-        status = "Active ✅" if acc['is_active'] else "Inactive ❌"
-        caption += f"{i}. <code>{acc['phone_number']}</code> - <i>{status}</i>\n"
-        buttons.append([
-            InlineKeyboardButton(f"{acc['phone_number']} ({status})", callback_data=f"view_acc_{acc['_id']}"),
-            InlineKeyboardButton("Delete", callback_data=f"delete_acc_{acc['_id']}")
-        ])
-    
-    caption += "\n<blockquote>Choose an account to delete:</blockquote>"
-    buttons.append([InlineKeyboardButton("Back", callback_data="menu_main")])
-    
-    await cb.message.edit_caption(
-        caption=caption,
-        reply_markup=kb(buttons),
-        parse_mode=ParseMode.HTML
-    )
+    try:
+        uid = cb.from_user.id
+        accounts = db.get_user_accounts(uid)
+        if not accounts:
+            try:
+                await cb.message.edit_caption(
+                    caption="""<blockquote><b>╰_╯NO ACCOUNTS TO DELETE</b></blockquote>\n\n"""
+                            """Add an account to start Advertising!""",
+                    reply_markup=kb([[InlineKeyboardButton("Add Account", callback_data="host_account"),
+                                    InlineKeyboardButton("Back", callback_data="menu_main")]]),
+                    parse_mode=ParseMode.HTML
+                )
+            except MessageNotModified:
+                pass
+            await cb.answer()
+            return
+        
+        caption = "<blockquote><b>╰_╯ DELETE ACCOUNTS</b></blockquote>\n\n"
+        buttons = []
+        for i, acc in enumerate(accounts, 1):
+            status = "Active ✅" if acc['is_active'] else "Inactive ❌"
+            caption += f"{i}. <code>{acc['phone_number']}</code> - <i>{status}</i>\n"
+            buttons.append([InlineKeyboardButton(f"Delete {acc['phone_number']}", callback_data=f"delete_acc_{acc['_id']}")])
+        
+        buttons.append([InlineKeyboardButton("Delete All Accounts ⚠️", callback_data="delete_all_accounts")])
+        buttons.append([InlineKeyboardButton("Back 🔙", callback_data="view_accounts")])
+        
+        try:
+            await cb.message.edit_caption(
+                caption=caption,
+                reply_markup=kb(buttons),
+                parse_mode=ParseMode.HTML
+            )
+        except MessageNotModified:
+            pass
+        await cb.answer()
+    except Exception as e:
+        logger.error(f"Error in delete_accounts: {e}")
+        try:
+            await cb.answer()
+        except Exception:
+            pass
 
 @pyro.on_callback_query(filters.regex("delete_acc_"))
 async def delete_account(client, cb):
