@@ -680,20 +680,176 @@ async def send_ad_doc(tg_client, gid, ad_doc):
         )
 
 
+# Track when an account last appealed to @SpamBot to avoid spamming the bot
+spambot_appeals_last_time = {}
+
+async def appeal_spambot(tg_client, phone, user_id):
+    """
+    Automatically contact @SpamBot to request unlifting restrictions:
+    1. Send /start to @SpamBot.
+    2. Check response for expiry date / limitation status.
+    3. Click 'This is a mistake' -> 'Yes' -> 'No! Never did that!'.
+    4. Submit complaint text explaining it is a mistake.
+    5. Notify user in DM with appeal status and expiry date.
+    """
+    last_time = spambot_appeals_last_time.get(phone, 0)
+    now_ts = time.time()
+    # Don't appeal more than once every 12 hours per account
+    if now_ts - last_time < 12 * 3600:
+        logger.info(f"Account {phone} already appealed to @SpamBot recently. Skipping duplicate appeal.")
+        return
+
+    spambot_appeals_last_time[phone] = now_ts
+    try:
+        logger.info(f"Account {phone} starting automated @SpamBot appeal...")
+        spambot = await tg_client.get_entity('SpamBot')
+        await tg_client.send_message(spambot, '/start')
+        await asyncio.sleep(3)
+
+        msgs = await tg_client.get_messages(spambot, limit=2)
+        if not msgs:
+            return
+
+        msg = msgs[0]
+        full_text = msg.text or ""
+
+        # Check if free of restrictions
+        if "no limits are currently applied" in full_text.lower() or "good news" in full_text.lower():
+            logger.info(f"Account {phone} is free of restrictions according to @SpamBot.")
+            await send_dm_log(user_id, f"<b>🎉 Account Healthy:</b> <code>{phone}</code> is free of restrictions according to @SpamBot!")
+            return
+
+        # Extract expiry date if present (e.g. "until 13 Oct 2026, 13:55 UTC")
+        expiry_match = re.search(r'until\s+([0-9]+\s+[A-Za-z]+\s+[0-9]{4}[^.]+)', full_text, re.IGNORECASE)
+        expiry_str = expiry_match.group(1).strip() if expiry_match else "Temporary limitation"
+
+        clicked_action = None
+        if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
+            # Step 1: Look for 'This is a mistake'
+            for r in msg.reply_markup.rows:
+                for b in r.buttons:
+                    if "this is a mistake" in b.text.lower():
+                        clicked_action = "This is a mistake"
+                        await msg.click(text=b.text)
+                        break
+                if clicked_action:
+                    break
+
+            if clicked_action:
+                await asyncio.sleep(3)
+                next_msgs = await tg_client.get_messages(spambot, limit=1)
+                if next_msgs and next_msgs[0].reply_markup and hasattr(next_msgs[0].reply_markup, 'rows'):
+                    n_msg = next_msgs[0]
+                    # Step 2: Click 'Yes'
+                    for r in n_msg.reply_markup.rows:
+                        for b in r.buttons:
+                            if b.text.strip().lower() == "yes":
+                                await n_msg.click(text=b.text)
+                                break
+
+                    await asyncio.sleep(3)
+                    conf_msgs = await tg_client.get_messages(spambot, limit=1)
+                    if conf_msgs and conf_msgs[0].reply_markup and hasattr(conf_msgs[0].reply_markup, 'rows'):
+                        c_msg = conf_msgs[0]
+                        # Step 3: Click 'No! Never did that!'
+                        for r in c_msg.reply_markup.rows:
+                            for b in r.buttons:
+                                if "never did that" in b.text.lower():
+                                    await c_msg.click(text=b.text)
+                                    break
+
+                        await asyncio.sleep(3)
+                        final_msgs = await tg_client.get_messages(spambot, limit=1)
+                        if final_msgs:
+                            f_text = final_msgs[0].text or ""
+                            if "write" in f_text.lower() or "details" in f_text.lower() or "explain" in f_text.lower():
+                                await tg_client.send_message(
+                                    spambot,
+                                    "This is a mistake. I have not violated any rules or sent spam. Please unlift the restrictions on my account."
+                                )
+                                logger.info(f"Account {phone} submitted written appeal explanation to @SpamBot.")
+
+            elif any("release me" in b.text.lower() for r in msg.reply_markup.rows for b in r.buttons):
+                for r in msg.reply_markup.rows:
+                    for b in r.buttons:
+                        if "release me" in b.text.lower():
+                            await msg.click(text=b.text)
+                            clicked_action = b.text
+                            break
+                    if clicked_action:
+                        break
+
+        await send_dm_log(
+            user_id,
+            f"<b>🤖 @SpamBot Appeal Submitted:</b> <code>{phone}</code>\n"
+            f"• <b>Status:</b> Applied to @SpamBot ('This is a mistake')\n"
+            f"• <b>Limitation Period:</b> <code>{expiry_str}</code>\n"
+            f"<i>✅ Requested Telegram to unlift restrictions. Broadcasting paused for this account.</i>"
+        )
+        logger.info(f"Automated @SpamBot appeal finished for {phone} (Expiry: {expiry_str})")
+
+    except Exception as e:
+        logger.error(f"Failed to submit @SpamBot appeal for {phone}: {e}")
+
+
 def check_entity_restricted(entity):
-    """Check if an entity is restricted, muted, or write-forbidden for normal members."""
+    """
+    Check if an entity is restricted, muted, or write-forbidden.
+    Returns: (is_restricted, should_leave, reason)
+    Policy:
+    - If mute duration is <= 48 hours: should_leave = False (temporary mute/wait, ignore/stay).
+    - If permanent or longer than 48 hours: should_leave = True (leave group).
+    """
     if not entity:
-        return False, None
-    if getattr(entity, 'restricted', False):
-        return True, "Account restricted"
+        return False, False, None
+
+    now = datetime.now(timezone.utc)
+
+    def parse_rem_seconds(until_date):
+        if not until_date:
+            return None
+        if isinstance(until_date, datetime):
+            if until_date.tzinfo is None:
+                until_date = until_date.replace(tzinfo=timezone.utc)
+            return (until_date - now).total_seconds()
+        elif isinstance(until_date, (int, float)):
+            return float(until_date) - time.time()
+        return None
+
+    # 1. Account specific banned_rights in this chat
     banned_rights = getattr(entity, 'banned_rights', None)
     if banned_rights and getattr(banned_rights, 'send_messages', False):
-        return True, "Muted by group admin"
+        until_date = getattr(banned_rights, 'until_date', None)
+        rem_seconds = parse_rem_seconds(until_date)
+        if rem_seconds is not None:
+            if 0 < rem_seconds <= 48 * 3600:
+                hours_left = round(rem_seconds / 3600, 1)
+                return True, False, f"Temporary mute ({hours_left}h left, <= 48h)"
+            else:
+                return True, True, "Muted longer than 48h or permanent"
+        else:
+            return True, True, "Permanently muted by group admin"
+
+    # 2. General channel restriction flag
+    if getattr(entity, 'restricted', False):
+        return True, True, "Channel restricted by Telegram"
+
+    # 3. Default banned rights (group write closed for normal members)
     default_rights = getattr(entity, 'default_banned_rights', None)
     admin_rights = getattr(entity, 'admin_rights', None)
     if default_rights and getattr(default_rights, 'send_messages', False) and not admin_rights:
-        return True, "Group write permissions closed"
-    return False, None
+        until_date = getattr(default_rights, 'until_date', None)
+        rem_seconds = parse_rem_seconds(until_date)
+        if rem_seconds is not None:
+            if 0 < rem_seconds <= 48 * 3600:
+                hours_left = round(rem_seconds / 3600, 1)
+                return True, False, f"Group write temporarily closed ({hours_left}h left, <= 48h)"
+            else:
+                return True, True, "Group write closed > 48h or permanent"
+        else:
+            return True, True, "Group write permissions permanently closed"
+
+    return False, False, None
 
 
 async def run_broadcast(client, uid, account_ids=None):
@@ -771,11 +927,14 @@ async def run_broadcast(client, uid, account_ids=None):
                 cached_groups = []
                 async for dialog in tg_client.iter_dialogs(limit=100):
                     if dialog.is_group:
-                        # Automated check: if account is muted, banned, or write-forbidden, leave immediately
-                        is_restr, restr_reason = check_entity_restricted(dialog.entity)
+                        # Automated check: if account is muted, banned, or write-forbidden
+                        is_restr, should_leave, restr_reason = check_entity_restricted(dialog.entity)
                         if is_restr:
-                            logger.info(f"Account {acc['phone_number']} auto-leaving restricted/muted group {dialog.name} ({dialog.id}): {restr_reason}")
-                            await safe_leave_group(tg_client, dialog.id, user_id=uid)
+                            if should_leave:
+                                logger.info(f"Account {acc['phone_number']} auto-leaving permanent/>48h group {dialog.name} ({dialog.id}): {restr_reason}")
+                                await safe_leave_group(tg_client, dialog.id, user_id=uid)
+                            else:
+                                logger.info(f"Account {acc['phone_number']} in temporarily muted group {dialog.name} ({dialog.id}): {restr_reason}. Kept in group.")
                             continue
 
                         norm_id = normalize_tg_id(dialog.id)
@@ -790,9 +949,10 @@ async def run_broadcast(client, uid, account_ids=None):
                     logger.info(f"No groups matched filter for {acc['phone_number']}, falling back to active group dialogs")
                     async for dialog in tg_client.iter_dialogs(limit=100):
                         if dialog.is_group:
-                            is_restr, restr_reason = check_entity_restricted(dialog.entity)
+                            is_restr, should_leave, restr_reason = check_entity_restricted(dialog.entity)
                             if is_restr:
-                                await safe_leave_group(tg_client, dialog.id, user_id=uid)
+                                if should_leave:
+                                    await safe_leave_group(tg_client, dialog.id, user_id=uid)
                                 continue
                             norm_id = normalize_tg_id(dialog.id)
                             if dialog.id in skip_group_ids or norm_id in skip_group_ids:
@@ -962,32 +1122,56 @@ async def run_broadcast(client, uid, account_ids=None):
                                 if any(ban.lower() in err_full.lower() for ban in ACCOUNT_BAN_ERRORS):
                                     logger.warning(f"Account {phone} banned/restricted: {err_full}")
                                     banned_accounts.add(acc_id)
-                                    if "banned from sending messages" in err_full.lower():
-                                        await send_dm_log(
-                                            uid,
-                                            f"<b>⚠️ Account Spam-Restricted by Telegram:</b> <code>{phone}</code>\n"
-                                            f"<i>Telegram SpamBot has temporarily blocked this phone from posting in supergroups/channels.</i>\n"
-                                            f"<i>💡 Check @SpamBot on this number to see expiry time. Broadcasting paused for this account.</i>"
-                                        )
+                                    if "banned from sending messages" in err_full.lower() or "spambot" in err_full.lower():
+                                        # Automatically apply to @SpamBot requesting unlift of restrictions
+                                        asyncio.create_task(appeal_spambot(tg_client, phone, uid))
                                     else:
                                         db.deactivate_account(acc_id)
                                         await send_dm_log(uid, f"<b>🚫 Account deactivated (session expired/banned):</b> <code>{phone}</code>\n<i>{err_str}</i>")
                                     return
 
-                                # 2. Group-level restriction (muted, write forbidden, admin only, etc.)
+                                # 2. Slowmode wait (seconds/minutes <= 48h): ignore and stay in group
+                                if "slowmode" in err_full.lower():
+                                    logger.info(f"Group {group_name} ({gid}) slowmode wait for {phone}. Staying in group.")
+                                    await send_dm_log(uid, f"<b>⏳ Slowmode wait in {group_name}:</b> {err_str[:60]}. Staying in group.")
+                                    continue
+
+                                # 3. Group-level restriction (muted, write forbidden, admin only, etc.)
                                 if any(restr.lower() in err_full.lower() for restr in GROUP_RESTRICTED_ERRORS):
-                                    logger.info(f"Group {group_name} ({gid}) is restricted/muted for {phone}. Auto-exiting group...")
-                                    await safe_leave_group(tg_client, gid, user_id=uid)
-                                    # Remove from this account's cache and assigned list
-                                    group_cache[acc_id] = [g for g in group_cache.get(acc_id, []) if g[0] != gid]
-                                    assigned_groups[acc_id] = [g for g in assigned_groups.get(acc_id, []) if g[0] != gid]
-                                    await send_dm_log(
-                                        uid,
-                                        f"<b>🚪 Auto-Left Group:</b> <i>{group_name}</i>\n"
-                                        f"Account <code>{phone}</code> was muted/banned/restricted.\n"
-                                        f"<i>Reason: {err_str[:70]}</i>\n"
-                                        f"<i>✅ Exited group automatically to protect account safety!</i>"
-                                    )
+                                    is_temp_mute = False
+                                    rem_str = ""
+                                    try:
+                                        part = await tg_client(functions.channels.GetParticipantRequest(channel=gid, participant='me'))
+                                        b_rights = getattr(part.participant, 'banned_rights', None)
+                                        if b_rights and getattr(b_rights, 'send_messages', False):
+                                            u_date = getattr(b_rights, 'until_date', None)
+                                            if u_date:
+                                                if hasattr(u_date, 'tzinfo') and u_date.tzinfo is None:
+                                                    u_date = u_date.replace(tzinfo=timezone.utc)
+                                                now_utc = datetime.now(timezone.utc)
+                                                rem_sec = (u_date - now_utc).total_seconds()
+                                                if 0 < rem_sec <= 48 * 3600:
+                                                    is_temp_mute = True
+                                                    rem_str = f"{round(rem_sec / 3600, 1)}h"
+                                    except Exception:
+                                        pass
+
+                                    if is_temp_mute:
+                                        logger.info(f"Group {group_name} ({gid}) is temporarily muted for {phone} ({rem_str} left, <=48h). Staying in group.")
+                                        await send_dm_log(uid, f"<b>⏳ Temporarily muted in {group_name}:</b> {rem_str} remaining (<=48h). Staying in group.")
+                                    else:
+                                        logger.info(f"Group {group_name} ({gid}) is permanently or >48h restricted for {phone}. Auto-exiting group...")
+                                        await safe_leave_group(tg_client, gid, user_id=uid)
+                                        # Remove from this account's cache and assigned list
+                                        group_cache[acc_id] = [g for g in group_cache.get(acc_id, []) if g[0] != gid]
+                                        assigned_groups[acc_id] = [g for g in assigned_groups.get(acc_id, []) if g[0] != gid]
+                                        await send_dm_log(
+                                            uid,
+                                            f"<b>🚪 Auto-Left Group:</b> <i>{group_name}</i>\n"
+                                            f"Account <code>{phone}</code> was permanently muted or muted > 48h.\n"
+                                            f"<i>Reason: {err_str[:70]}</i>\n"
+                                            f"<i>✅ Exited group automatically!</i>"
+                                        )
                                 else:
                                     error_summary.append(f"{group_name}: {err_str}")
                                     await send_dm_log(uid, f"<b>❌ Failed to send to {group_name}:</b> {err_str}")
@@ -1027,6 +1211,35 @@ async def run_broadcast(client, uid, account_ids=None):
 
                 if not db.get_broadcast_state(uid).get("running", False):
                     break
+
+                # ── Post-Cycle Scan across all active accounts ────────────────
+                logger.info(f"Running post-cycle group restriction scan for user {uid}...")
+                post_scan_left = 0
+                for aid in list(clients.keys()):
+                    if aid in banned_accounts:
+                        continue
+                    tg_c, s_str, p_num = clients[aid]
+                    try:
+                        async for dlg in tg_c.iter_dialogs(limit=100):
+                            if dlg.is_group:
+                                is_r, should_l, r_reason = check_entity_restricted(dlg.entity)
+                                if is_r and should_l:
+                                    logger.info(f"Post-cycle: Auto-leaving group {dlg.name} ({dlg.id}) for {p_num}: {r_reason}")
+                                    await safe_leave_group(tg_c, dlg.id, user_id=uid)
+                                    group_cache[aid] = [g for g in group_cache.get(aid, []) if g[0] != dlg.id]
+                                    assigned_groups[aid] = [g for g in assigned_groups.get(aid, []) if g[0] != dlg.id]
+                                    post_scan_left += 1
+                                    await send_dm_log(
+                                        uid,
+                                        f"<b>🚪 Post-Cycle Auto-Left:</b> <i>{dlg.name}</i>\n"
+                                        f"Account <code>{p_num}</code> (Reason: {r_reason})\n"
+                                        f"<i>✅ Exited permanent/>48h restricted group!</i>"
+                                    )
+                    except Exception as scan_err:
+                        logger.error(f"Post-cycle scan error for {p_num}: {scan_err}")
+
+                if post_scan_left > 0:
+                    logger.info(f"Post-cycle scan finished: auto-left {post_scan_left} restricted groups.")
 
                 cycle_count += 1
                 db.increment_broadcast_cycle(uid)
