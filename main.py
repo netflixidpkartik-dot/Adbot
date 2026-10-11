@@ -53,6 +53,9 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
     SessionExpiredError,
+    SessionRevokedError,
+    AuthKeyUnregisteredError,
+    UserDeactivatedError,
     PasswordHashInvalidError,
     AboutTooLongError,
     ChannelsTooMuchError,
@@ -683,14 +686,51 @@ async def send_ad_doc(tg_client, gid, ad_doc):
 # Track when an account last appealed to @SpamBot to avoid spamming the bot
 spambot_appeals_last_time = {}
 
-async def appeal_spambot(tg_client, phone, user_id):
+# In-memory storage for SpamBot restricted accounts: {acc_id: {"phone": phone, "expiry_ts": expiry_ts, "user_id": uid}}
+spambot_restricted_accounts = {}
+
+async def check_spambot_status(tg_client):
+    """
+    Check if an account is currently restricted by @SpamBot.
+    Returns: (is_restricted, expiry_ts, info_str)
+    """
+    try:
+        spambot = await tg_client.get_entity('SpamBot')
+        await tg_client.send_message(spambot, '/start')
+        await asyncio.sleep(3)
+        msgs = await tg_client.get_messages(spambot, limit=1)
+        if not msgs:
+            return False, 0, "No response from @SpamBot"
+        text = msgs[0].text or ""
+
+        # Check clean status
+        if any(w in text.lower() for w in ["no limits", "free as a bird", "good news"]):
+            return False, 0, "No limits currently applied"
+
+        # Check expiration date
+        m = re.search(r'until\s+([0-9]+\s+[A-Za-z]+\s+[0-9]{4},\s+[0-9]+:[0-9]+)\s*UTC', text, re.IGNORECASE)
+        if m:
+            dt_str = m.group(1)
+            try:
+                dt = datetime.strptime(dt_str, '%d %b %Y, %H:%M').replace(tzinfo=timezone.utc)
+                return True, dt.timestamp(), f"Limited until {dt_str} UTC"
+            except Exception:
+                pass
+
+        return True, 0, "Limited (no specific expiry)"
+    except Exception as e:
+        logger.error(f"Error checking @SpamBot status: {e}")
+        return True, 0, str(e)
+
+
+async def appeal_spambot(tg_client, phone, user_id, acc_id=None):
     """
     Automatically contact @SpamBot to request unlifting restrictions:
     1. Send /start to @SpamBot.
     2. Check response for expiry date / limitation status.
     3. Click 'This is a mistake' -> 'Yes' -> 'No! Never did that!'.
     4. Submit complaint text explaining it is a mistake.
-    5. Notify user in DM with appeal status and expiry date.
+    5. Save expiry timestamp and notify user in DM.
     """
     last_time = spambot_appeals_last_time.get(phone, 0)
     now_ts = time.time()
@@ -716,12 +756,31 @@ async def appeal_spambot(tg_client, phone, user_id):
         # Check if free of restrictions
         if "no limits are currently applied" in full_text.lower() or "good news" in full_text.lower():
             logger.info(f"Account {phone} is free of restrictions according to @SpamBot.")
+            if acc_id and acc_id in spambot_restricted_accounts:
+                del spambot_restricted_accounts[acc_id]
             await send_dm_log(user_id, f"<b>🎉 Account Healthy:</b> <code>{phone}</code> is free of restrictions according to @SpamBot!")
             return
 
-        # Extract expiry date if present (e.g. "until 13 Oct 2026, 13:55 UTC")
-        expiry_match = re.search(r'until\s+([0-9]+\s+[A-Za-z]+\s+[0-9]{4}[^.]+)', full_text, re.IGNORECASE)
-        expiry_str = expiry_match.group(1).strip() if expiry_match else "Temporary limitation"
+        # Extract expiry date if present
+        expiry_ts = 0
+        expiry_match = re.search(r'until\s+([0-9]+\s+[A-Za-z]+\s+[0-9]{4},\s+[0-9]+:[0-9]+)\s*UTC', full_text, re.IGNORECASE)
+        if expiry_match:
+            expiry_str = f"until {expiry_match.group(1)} UTC"
+            try:
+                dt = datetime.strptime(expiry_match.group(1), '%d %b %Y, %H:%M').replace(tzinfo=timezone.utc)
+                expiry_ts = dt.timestamp()
+            except Exception:
+                pass
+        else:
+            expiry_match_simple = re.search(r'until\s+([0-9]+\s+[A-Za-z]+\s+[0-9]{4}[^.]+)', full_text, re.IGNORECASE)
+            expiry_str = expiry_match_simple.group(1).strip() if expiry_match_simple else "Temporary limitation"
+
+        if acc_id:
+            spambot_restricted_accounts[acc_id] = {
+                "phone": phone,
+                "expiry_ts": expiry_ts,
+                "user_id": user_id
+            }
 
         clicked_action = None
         if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
@@ -784,7 +843,7 @@ async def appeal_spambot(tg_client, phone, user_id):
             f"<b>🤖 @SpamBot Appeal Submitted:</b> <code>{phone}</code>\n"
             f"• <b>Status:</b> Applied to @SpamBot ('This is a mistake')\n"
             f"• <b>Limitation Period:</b> <code>{expiry_str}</code>\n"
-            f"<i>✅ Requested Telegram to unlift restrictions. Broadcasting paused for this account.</i>"
+            f"<i>✅ Requested Telegram to unlift restrictions. Bot will automatically resume this account once restrictions are lifted!</i>"
         )
         logger.info(f"Automated @SpamBot appeal finished for {phone} (Expiry: {expiry_str})")
 
@@ -907,12 +966,12 @@ async def run_broadcast(client, uid, account_ids=None):
                 )
                 await tg_client.connect()
 
-                # Check auth directly — no double-connect via validate_session
+                # Check auth directly — if session was logged out/terminated in Telegram Devices, remove from bot & DB
                 if not await tg_client.is_user_authorized():
                     await tg_client.disconnect()
-                    db.deactivate_account(acc['_id'])
-                    logger.warning(f"Deactivated unauthorized session for {acc['phone_number']}")
-                    await send_dm_log(uid, f"<b>⚠️ Account deactivated (unauthorized):</b> <code>{acc['phone_number']}</code>")
+                    db.delete_user_account(uid, str(acc['_id']))
+                    logger.warning(f"Deleted terminated session for {acc['phone_number']} (ID: {acc['_id']})")
+                    await send_dm_log(uid, f"<b>🗑️ Session Terminated / Logged Out:</b> Account <code>{acc['phone_number']}</code> was logged out from Telegram Devices and has been automatically removed from the bot.")
                     continue
 
                 # Auto-join the ad source channel if not already in it
@@ -923,9 +982,22 @@ async def run_broadcast(client, uid, account_ids=None):
                     except Exception as e:
                         logger.info(f"Account {acc['phone_number']} already in channel or join skipped: {e}")
 
-                # Fetch active groups and automatically leave any muted/banned groups
+                # Fetch active groups and automatically leave any broadcast channels or muted/banned groups
                 cached_groups = []
                 async for dialog in tg_client.iter_dialogs(limit=100):
+                    # Auto-leave broadcast channels (keep only groups; broadcast channels cannot be posted to)
+                    if dialog.is_channel and not dialog.is_group:
+                        norm_ch_id = normalize_tg_id(dialog.id)
+                        if dialog.id in skip_group_ids or norm_ch_id in skip_group_ids:
+                            continue
+                        ch_uname = getattr(dialog.entity, 'username', '') or ''
+                        if config.AD_SOURCE_CHANNEL and (ch_uname.lower() == str(config.AD_SOURCE_CHANNEL).lstrip('@').lower() or str(dialog.id) == str(config.AD_SOURCE_CHANNEL)):
+                            continue
+                        logger.info(f"Account {acc['phone_number']} auto-leaving broadcast channel {dialog.name} ({dialog.id})")
+                        await safe_leave_group(tg_client, dialog.id, user_id=uid)
+                        await asyncio.sleep(random.uniform(2.5, 4.0))
+                        continue
+
                     if dialog.is_group:
                         # Automated check: if account is muted, banned, or write-forbidden
                         is_restr, should_leave, restr_reason = check_entity_restricted(dialog.entity)
@@ -933,6 +1005,7 @@ async def run_broadcast(client, uid, account_ids=None):
                             if should_leave:
                                 logger.info(f"Account {acc['phone_number']} auto-leaving permanent/>48h group {dialog.name} ({dialog.id}): {restr_reason}")
                                 await safe_leave_group(tg_client, dialog.id, user_id=uid)
+                                await asyncio.sleep(random.uniform(2.5, 4.0))
                             else:
                                 logger.info(f"Account {acc['phone_number']} in temporarily muted group {dialog.name} ({dialog.id}): {restr_reason}. Kept in group.")
                             continue
@@ -948,11 +1021,14 @@ async def run_broadcast(client, uid, account_ids=None):
                 if not cached_groups:
                     logger.info(f"No groups matched filter for {acc['phone_number']}, falling back to active group dialogs")
                     async for dialog in tg_client.iter_dialogs(limit=100):
+                        if dialog.is_channel and not dialog.is_group:
+                            continue
                         if dialog.is_group:
                             is_restr, should_leave, restr_reason = check_entity_restricted(dialog.entity)
                             if is_restr:
                                 if should_leave:
                                     await safe_leave_group(tg_client, dialog.id, user_id=uid)
+                                    await asyncio.sleep(random.uniform(2.5, 4.0))
                                 continue
                             norm_id = normalize_tg_id(dialog.id)
                             if dialog.id in skip_group_ids or norm_id in skip_group_ids:
@@ -969,7 +1045,19 @@ async def run_broadcast(client, uid, account_ids=None):
                 if i < len(accounts) - 1:
                     await asyncio.sleep(0.5)
 
+            except (AuthKeyUnregisteredError, SessionRevokedError, SessionExpiredError, UserDeactivatedError) as sess_err:
+                logger.warning(f"Session terminated/revoked for {acc['phone_number']}: {sess_err}. Deleting account from bot & DB.")
+                db.delete_user_account(uid, str(acc['_id']))
+                await send_dm_log(uid, f"<b>🗑️ Session Terminated / Logged Out:</b> Account <code>{acc['phone_number']}</code> was logged out from Telegram Devices and has been automatically removed from the bot.")
+                continue
+
             except Exception as e:
+                err_txt = str(e).lower()
+                if any(k in err_txt for k in ("authkeyunregistered", "sessionrevoked", "sessionexpired", "userdeactivated", "authkeyduplicated")):
+                    logger.warning(f"Session terminated/revoked for {acc['phone_number']}: {e}. Deleting account from bot & DB.")
+                    db.delete_user_account(uid, str(acc['_id']))
+                    await send_dm_log(uid, f"<b>🗑️ Session Terminated / Logged Out:</b> Account <code>{acc['phone_number']}</code> was logged out from Telegram Devices and has been automatically removed from the bot.")
+                    continue
                 logger.error(f"Failed to start client for {acc['phone_number']}: {e}")
                 failed_count += 1
                 db.increment_broadcast_stats(uid, False)
@@ -1118,16 +1206,33 @@ async def run_broadcast(client, uid, account_ids=None):
                                     failed_count += 1
                                     db.increment_broadcast_stats(uid, False)
 
+                                # 0. Terminated session (auth key unregistered, session revoked, expired, user deactivated)
+                                is_session_dead = (
+                                    isinstance(e, (AuthKeyUnregisteredError, SessionRevokedError, SessionExpiredError, UserDeactivatedError)) or
+                                    any(k in err_full.lower() for k in ("authkeyunregistered", "sessionrevoked", "sessionexpired", "userdeactivated", "authkeyduplicated"))
+                                )
+                                if is_session_dead:
+                                    logger.warning(f"Session terminated for {phone} ({err_full}). Deleting from bot & DB.")
+                                    banned_accounts.add(acc_id)
+                                    db.delete_user_account(uid, str(acc_id))
+                                    await send_dm_log(uid, f"<b>🗑️ Session Terminated / Logged Out:</b> Account <code>{phone}</code> was logged out from Telegram Devices and has been automatically removed from the bot.")
+                                    return
+
                                 # 1. Account-level ban or Telegram SpamBot restriction
                                 if any(ban.lower() in err_full.lower() for ban in ACCOUNT_BAN_ERRORS):
                                     logger.warning(f"Account {phone} banned/restricted: {err_full}")
                                     banned_accounts.add(acc_id)
                                     if "banned from sending messages" in err_full.lower() or "spambot" in err_full.lower():
-                                        # Automatically apply to @SpamBot requesting unlift of restrictions
-                                        asyncio.create_task(appeal_spambot(tg_client, phone, uid))
+                                        # Register in restricted accounts and appeal to @SpamBot
+                                        spambot_restricted_accounts[acc_id] = {
+                                            "phone": phone,
+                                            "expiry_ts": 0,
+                                            "user_id": uid
+                                        }
+                                        asyncio.create_task(appeal_spambot(tg_client, phone, uid, acc_id))
                                     else:
                                         db.deactivate_account(acc_id)
-                                        await send_dm_log(uid, f"<b>🚫 Account deactivated (session expired/banned):</b> <code>{phone}</code>\n<i>{err_str}</i>")
+                                        await send_dm_log(uid, f"<b>🚫 Account deactivated (banned):</b> <code>{phone}</code>\n<i>{err_str}</i>")
                                     return
 
                                 # 2. Slowmode wait (seconds/minutes <= 48h): ignore and stay in group
@@ -1212,34 +1317,163 @@ async def run_broadcast(client, uid, account_ids=None):
                 if not db.get_broadcast_state(uid).get("running", False):
                     break
 
-                # ── Post-Cycle Scan across all active accounts ────────────────
-                logger.info(f"Running post-cycle group restriction scan for user {uid}...")
-                post_scan_left = 0
+                # ── POST-CYCLE MAINTENANCE (Automated Scan & Cleanup) ─────────
+                # Runs safely after each broadcast cycle and completes BEFORE the next cycle countdown.
+                logger.info(f"Running comprehensive post-cycle maintenance for user {uid}...")
+                maint_channels_left = 0
+                maint_groups_left = 0
+                maint_sessions_deleted = 0
+                maint_accounts_recovered = 0
+
+                # 1. Check SpamBot restricted accounts to see if restrictions have been uplifted
+                for s_aid in list(spambot_restricted_accounts.keys()):
+                    if s_aid in clients:
+                        s_client, s_str, s_phone = clients[s_aid]
+                        try:
+                            is_still_restricted, exp_ts, spambot_info = await check_spambot_status(s_client)
+                            if not is_still_restricted:
+                                logger.info(f"Post-cycle: Account {s_phone} is now free of SpamBot restrictions! Resuming...")
+                                banned_accounts.discard(s_aid)
+                                del spambot_restricted_accounts[s_aid]
+                                maint_accounts_recovered += 1
+
+                                # Reload active groups for this recovered account
+                                rec_groups = []
+                                async for dlg in s_client.iter_dialogs(limit=100):
+                                    if dlg.is_group:
+                                        is_r, should_l, _ = check_entity_restricted(dlg.entity)
+                                        if not is_r:
+                                            norm_id = normalize_tg_id(dlg.id)
+                                            if normalized_group_ids is None or norm_id in normalized_group_ids or dlg.id in (group_ids or []):
+                                                if dlg.id not in skip_group_ids and norm_id not in skip_group_ids:
+                                                    rec_groups.append((dlg.id, dlg.name))
+                                random.shuffle(rec_groups)
+                                group_cache[s_aid] = rec_groups
+
+                                await send_dm_log(
+                                    uid,
+                                    f"<b>🎉 Account Restrictions Lifted!</b>\n"
+                                    f"Account <code>{s_phone}</code> is now completely clean according to @SpamBot!\n"
+                                    f"<i>✅ Automatically resumed broadcasting with this account ({len(rec_groups)} groups ready).</i>"
+                                )
+                            else:
+                                spambot_restricted_accounts[s_aid]["expiry_ts"] = exp_ts
+                                logger.info(f"Account {s_phone} still restricted by @SpamBot ({spambot_info}). Waiting for unlift.")
+                        except Exception as sp_err:
+                            logger.warning(f"Error checking SpamBot status for {s_phone}: {sp_err}")
+
+                # 2. Check all accounts for session revocation (logged out from Telegram Devices)
                 for aid in list(clients.keys()):
+                    if not db.get_broadcast_state(uid).get("running", False):
+                        break
+                    tg_c, s_str, p_num = clients[aid]
+                    is_auth = False
+                    try:
+                        if not tg_c.is_connected():
+                            await tg_c.connect()
+                        is_auth = await tg_c.is_user_authorized()
+                    except (AuthKeyUnregisteredError, SessionRevokedError, SessionExpiredError, UserDeactivatedError):
+                        is_auth = False
+                    except Exception as auth_err:
+                        err_txt = str(auth_err).lower()
+                        if any(k in err_txt for k in ("authkeyunregistered", "sessionrevoked", "sessionexpired", "userdeactivated", "authkeyduplicated")):
+                            is_auth = False
+                        else:
+                            is_auth = True  # Network glitch, do not delete
+
+                    if not is_auth:
+                        logger.warning(f"Post-cycle: Session for {p_num} was terminated/logged out from Telegram Devices. Removing from bot & DB.")
+                        banned_accounts.add(aid)
+                        try:
+                            await tg_c.disconnect()
+                        except Exception:
+                            pass
+                        db.delete_user_account(uid, str(aid))
+                        clients.pop(aid, None)
+                        group_cache.pop(aid, None)
+                        assigned_groups.pop(aid, None)
+                        maint_sessions_deleted += 1
+                        await send_dm_log(
+                            uid,
+                            f"<b>🗑️ Session Terminated / Logged Out:</b>\n"
+                            f"Account <code>{p_num}</code> was terminated from Telegram Devices section.\n"
+                            f"<i>✅ Automatically removed account from bot and database.</i>"
+                        )
+
+                # 3. Dialog Scan per account: Auto-leave broadcast channels & permanent/>48h muted groups
+                # Done safely with delays between leaves (2.5s - 4.0s) so accounts never get spammed or flood-waited.
+                protected_channel_usernames = set()
+                if config.AD_SOURCE_CHANNEL:
+                    protected_channel_usernames.add(str(config.AD_SOURCE_CHANNEL).lstrip('@').lower())
+
+                for aid in list(clients.keys()):
+                    if not db.get_broadcast_state(uid).get("running", False):
+                        break
                     if aid in banned_accounts:
                         continue
                     tg_c, s_str, p_num = clients[aid]
+
                     try:
                         async for dlg in tg_c.iter_dialogs(limit=100):
+                            if not db.get_broadcast_state(uid).get("running", False):
+                                break
+
+                            norm_d_id = normalize_tg_id(dlg.id)
+
+                            # ── Auto-Leave Broadcast Channels ──
+                            if dlg.is_channel and not dlg.is_group:
+                                # Protect essential channels (source channel, must join channel)
+                                if dlg.id in skip_group_ids or norm_d_id in skip_group_ids:
+                                    continue
+                                ch_uname = getattr(dlg.entity, 'username', '') or ''
+                                if ch_uname.lower() in protected_channel_usernames or str(dlg.id) == str(config.AD_SOURCE_CHANNEL):
+                                    continue
+
+                                # Safely leave broadcast channel
+                                logger.info(f"Post-cycle: Account {p_num} safely auto-leaving broadcast channel {dlg.name} ({dlg.id})")
+                                left = await safe_leave_group(tg_c, dlg.id, user_id=uid)
+                                if left:
+                                    maint_channels_left += 1
+                                    await asyncio.sleep(random.uniform(2.5, 4.0))
+                                continue
+
+                            # ── Auto-Leave Permanent / >48h Muted Groups ──
                             if dlg.is_group:
                                 is_r, should_l, r_reason = check_entity_restricted(dlg.entity)
                                 if is_r and should_l:
-                                    logger.info(f"Post-cycle: Auto-leaving group {dlg.name} ({dlg.id}) for {p_num}: {r_reason}")
-                                    await safe_leave_group(tg_c, dlg.id, user_id=uid)
-                                    group_cache[aid] = [g for g in group_cache.get(aid, []) if g[0] != dlg.id]
-                                    assigned_groups[aid] = [g for g in assigned_groups.get(aid, []) if g[0] != dlg.id]
-                                    post_scan_left += 1
-                                    await send_dm_log(
-                                        uid,
-                                        f"<b>🚪 Post-Cycle Auto-Left:</b> <i>{dlg.name}</i>\n"
-                                        f"Account <code>{p_num}</code> (Reason: {r_reason})\n"
-                                        f"<i>✅ Exited permanent/>48h restricted group!</i>"
-                                    )
-                    except Exception as scan_err:
-                        logger.error(f"Post-cycle scan error for {p_num}: {scan_err}")
+                                    logger.info(f"Post-cycle: Account {p_num} safely auto-leaving permanent/>48h group {dlg.name} ({dlg.id}): {r_reason}")
+                                    left = await safe_leave_group(tg_c, dlg.id, user_id=uid)
+                                    if left:
+                                        group_cache[aid] = [g for g in group_cache.get(aid, []) if g[0] != dlg.id]
+                                        assigned_groups[aid] = [g for g in assigned_groups.get(aid, []) if g[0] != dlg.id]
+                                        maint_groups_left += 1
+                                        await asyncio.sleep(random.uniform(2.5, 4.0))
+                                elif is_r and not should_l:
+                                    logger.info(f"Post-cycle: Account {p_num} kept in group {dlg.name} ({dlg.id}): {r_reason}")
 
-                if post_scan_left > 0:
-                    logger.info(f"Post-cycle scan finished: auto-left {post_scan_left} restricted groups.")
+                    except Exception as scan_err:
+                        logger.error(f"Post-cycle maintenance error for {p_num}: {scan_err}")
+
+                # Send summary DM notification if any maintenance actions occurred
+                maint_summary = []
+                if maint_channels_left > 0:
+                    maint_summary.append(f"• Exited {maint_channels_left} broadcast channel(s)")
+                if maint_groups_left > 0:
+                    maint_summary.append(f"• Exited {maint_groups_left} permanent/>48h muted group(s)")
+                if maint_sessions_deleted > 0:
+                    maint_summary.append(f"• Removed {maint_sessions_deleted} terminated session(s)")
+                if maint_accounts_recovered > 0:
+                    maint_summary.append(f"• Resumed {maint_accounts_recovered} SpamBot-recovered account(s)")
+
+                if maint_summary:
+                    await send_dm_log(
+                        uid,
+                        f"<b>🧹 Post-Cycle Maintenance Finished:</b>\n" +
+                        "\n".join(maint_summary) +
+                        f"\n<i>All cleanups completed safely without triggering spam limits!</i>"
+                    )
+
+                logger.info(f"Post-cycle maintenance finished for user {uid}. Starting countdown for next cycle.")
 
                 cycle_count += 1
                 db.increment_broadcast_cycle(uid)
@@ -2059,8 +2293,8 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
             await tg_client.connect()
             if not await tg_client.is_user_authorized():
                 await tg_client.disconnect()
-                db.deactivate_account(acc_id)
-                fail_list.append(f"• <code>{phone}</code>: ❌ Session unauthorized (deactivated)")
+                db.delete_user_account(uid, str(acc_id))
+                fail_list.append(f"• <code>{phone}</code>: ❌ Session logged out / removed from bot")
                 continue
 
             me = await tg_client.get_me()
@@ -2351,8 +2585,8 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
             await tg_client.connect()
             if not await tg_client.is_user_authorized():
                 await tg_client.disconnect()
-                db.deactivate_account(acc_id)
-                fail_list.append(f"• <code>{phone}</code>: ❌ Session unauthorized (deactivated)")
+                db.delete_user_account(uid, str(acc_id))
+                fail_list.append(f"• <code>{phone}</code>: ❌ Session logged out / removed from bot")
                 continue
 
             if folder_slug:
