@@ -275,8 +275,32 @@ GROUP_RESTRICTED_ERRORS = (
     "ChatAdminRequired",
     "RightForbidden",
     "ChatRestricted",
-    "You cannot write in this chat",
+    "ChatGuestSendForbidden",
+    "ChatSendMediaForbidden",
+    "ChatSendGifsForbidden",
+    "ChatSendPlainForbidden",
     "SlowmodeWait",
+    "ChannelInvalid",
+    "You cannot write in this chat",
+    "You're restricted from sending messages in this chat",
+    "restricted from sending messages",
+    "can't write in this chat",
+    "cannot write in this chat",
+    "banned from this group",
+    "banned in channel",
+    "muted in this group",
+    "not allowed to speak",
+    "write forbidden",
+    "send messages in this group",
+    "send messages in this channel",
+    "restricted until",
+    "CHAT_RESTRICTED",
+    "CHAT_WRITE_FORBIDDEN",
+    "USER_BANNED_IN_CHANNEL",
+    "CHANNEL_PRIVATE",
+    "USER_RESTRICTED",
+    "forbidden",
+    "restricted",
 )
 
 BAN_ERRORS = ACCOUNT_BAN_ERRORS
@@ -461,19 +485,28 @@ async def safe_reconnect(tg_client, session_str, phone):
         logger.error(f"Reconnect failed for {phone}: {e}")
         return False
 
-async def safe_leave_group(tg_client, gid):
-    """Safely leave a group or channel via Telethon."""
+async def safe_leave_group(tg_client, gid, user_id=None):
+    """Safely leave a group or channel via Telethon and clean from database."""
+    left = False
     try:
-        await tg_client.delete_dialog(gid)
-        return True
-    except Exception:
+        entity = await tg_client.get_entity(gid)
+        await tg_client(functions.channels.LeaveChannelRequest(channel=entity))
+        logger.info(f"Successfully left channel/megagroup {gid} via LeaveChannelRequest")
+        left = True
+    except Exception as e1:
         try:
-            entity = await tg_client.get_input_entity(gid)
-            await tg_client(functions.channels.LeaveChannelRequest(channel=entity))
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to leave group {gid}: {e}")
-            return False
+            await tg_client.delete_dialog(gid)
+            logger.info(f"Successfully left dialog {gid} via delete_dialog")
+            left = True
+        except Exception as e2:
+            logger.warning(f"Could not leave group {gid}: {e1} | {e2}")
+
+    if user_id:
+        try:
+            db.delete_target_group(user_id, gid)
+        except Exception:
+            pass
+    return left
 
 
 async def send_dm_log(user_id, log_message):
@@ -904,14 +937,16 @@ async def run_broadcast(client, uid, account_ids=None):
                                 # 2. Group-level restriction (muted, write forbidden, admin only, etc.)
                                 if any(restr.lower() in err_str.lower() for restr in GROUP_RESTRICTED_ERRORS):
                                     logger.info(f"Group {group_name} ({gid}) is restricted/muted for {phone}. Auto-exiting group...")
-                                    await safe_leave_group(tg_client, gid)
-                                    # Remove from this account's cache
+                                    await safe_leave_group(tg_client, gid, user_id=uid)
+                                    # Remove from this account's cache and assigned list
                                     group_cache[acc_id] = [g for g in group_cache.get(acc_id, []) if g[0] != gid]
+                                    assigned_groups[acc_id] = [g for g in assigned_groups.get(acc_id, []) if g[0] != gid]
                                     await send_dm_log(
                                         uid,
                                         f"<b>🚪 Auto-Left Group:</b> <i>{group_name}</i>\n"
-                                        f"Account <code>{phone}</code> was muted/restricted ({err_str}).\n"
-                                        f"<i>Exited group to protect account health.</i>"
+                                        f"Account <code>{phone}</code> was muted/banned/restricted.\n"
+                                        f"<i>Reason: {err_str[:70]}</i>\n"
+                                        f"<i>✅ Exited group automatically to protect account safety!</i>"
                                     )
                                 else:
                                     error_summary.append(f"{group_name}: {err_str}")
@@ -1483,6 +1518,7 @@ async def view_accounts(client, cb):
             InlineKeyboardButton("✏️ Change Bio (All)", callback_data="edit_bio_all"),
             InlineKeyboardButton("📁 Join Folder (All)", callback_data="join_folder_all")
         ])
+        buttons.append([InlineKeyboardButton("🚪 Auto-Leave Muted/Banned Groups", callback_data="leave_muted_groups_all")])
         buttons.append([InlineKeyboardButton("Back 🔙", callback_data="menu_main")])
         
         try:
@@ -2254,6 +2290,110 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
         reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
     )
     await send_dm_log(uid, f"<b>📁 Folder join:</b> {len(success_list)}/{len(targets)} accounts joined.")
+
+
+@pyro.on_callback_query(filters.regex(r"^leave_muted_groups_all$"))
+async def leave_muted_groups_all_cb(client, cb):
+    """Scan all hosted accounts and automatically leave any group where the account is muted, banned, or cannot write."""
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("No accounts hosted!", show_alert=True)
+        return
+
+    await cb.answer("⏳ Scanning accounts for muted/banned groups...", show_alert=False)
+    
+    status_msg = await cb.message.reply(
+        "⏳ <b>Auto-Cleanup Started...</b>\n\n"
+        f"Scanning <b>{len(accounts)}</b> account(s) for muted or banned groups.\n"
+        "<i>Accounts will automatically leave any group they cannot write in. Please wait...</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+    total_left = 0
+    account_results = []
+
+    for acc in accounts:
+        phone = acc.get("phone_number", "Unknown")
+        if not acc.get("is_active", True):
+            continue
+
+        try:
+            session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
+            tg_client = TelegramClient(
+                StringSession(session_str),
+                config.API_ID,
+                config.API_HASH,
+                connection_retries=2,
+                retry_delay=3,
+                receive_updates=False,
+            )
+            await tg_client.connect()
+            if not await tg_client.is_user_authorized():
+                await tg_client.disconnect()
+                continue
+
+            acc_left = 0
+            async for dialog in tg_client.iter_dialogs(limit=150):
+                if not dialog.is_group:
+                    continue
+
+                entity = dialog.entity
+                is_restricted = False
+                reason = ""
+
+                # Check account-specific restriction in this chat
+                if getattr(entity, 'restricted', False):
+                    is_restricted = True
+                    reason = "Account restricted"
+
+                # Check banned rights for member
+                banned_rights = getattr(entity, 'banned_rights', None)
+                if banned_rights and getattr(banned_rights, 'send_messages', False):
+                    is_restricted = True
+                    reason = "Muted from sending messages"
+
+                # Check default banned rights for chat (if chat is restricted for non-admins)
+                default_rights = getattr(entity, 'default_banned_rights', None)
+                admin_rights = getattr(entity, 'admin_rights', None)
+                if default_rights and getattr(default_rights, 'send_messages', False) and not admin_rights:
+                    is_restricted = True
+                    reason = "Group write permissions closed"
+
+                if is_restricted:
+                    left = await safe_leave_group(tg_client, dialog.id, user_id=uid)
+                    if left:
+                        acc_left += 1
+                        total_left += 1
+                        logger.info(f"Account {phone} auto-left {dialog.name} ({dialog.id}): {reason}")
+
+            await tg_client.disconnect()
+            account_results.append(f"• <code>{phone}</code>: Left <b>{acc_left}</b> muted group(s)")
+
+        except Exception as e:
+            logger.error(f"Error checking muted groups for {phone}: {e}")
+            account_results.append(f"• <code>{phone}</code>: ❌ Error ({str(e)[:30]})")
+
+    report = (
+        f"<blockquote><b>🚪 AUTO-CLEANUP COMPLETE! ✅</b></blockquote>\n\n"
+        f"<b>Total Muted/Banned Groups Left:</b> <code>{total_left}</code>\n"
+        f"<b>Accounts Scanned:</b> <code>{len(accounts)}</code>\n\n"
+        f"<b>Account Details:</b>\n"
+    )
+    report += "\n".join(account_results[:15])
+    report += "\n\n<i>All muted/restricted groups were cleanly exited to protect account health! 🛡️</i>"
+
+    try:
+        await status_msg.edit_text(
+            report,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([[InlineKeyboardButton("Back to Accounts 🔙", callback_data="view_accounts")]])
+        )
+    except Exception:
+        await cb.message.reply(report, parse_mode=ParseMode.HTML)
+
+    await send_dm_log(uid, f"<b>🚪 Auto-Cleanup:</b> Left {total_left} muted/banned groups across {len(accounts)} accounts.")
+
 
 @pyro.on_callback_query(filters.regex(r"^set_msg$"))
 async def set_msg(client, cb):

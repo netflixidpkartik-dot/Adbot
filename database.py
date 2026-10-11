@@ -550,6 +550,15 @@ class EnhancedDatabaseManager:
             logger.error(f"Failed to add target group for {user_id}: {e}")
             raise
 
+    def delete_target_group(self, user_id, group_id):
+        """Delete a target group for a user."""
+        try:
+            res = self.db.target_groups.delete_one({"user_id": user_id, "group_id": group_id})
+            return res.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Failed to delete target group {group_id} for {user_id}: {e}")
+            return False
+
     def get_user_analytics(self, user_id):
         """Fetch analytics for a user."""
         try:
