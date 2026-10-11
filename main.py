@@ -677,6 +677,22 @@ async def send_ad_doc(tg_client, gid, ad_doc):
         )
 
 
+def check_entity_restricted(entity):
+    """Check if an entity is restricted, muted, or write-forbidden for normal members."""
+    if not entity:
+        return False, None
+    if getattr(entity, 'restricted', False):
+        return True, "Account restricted"
+    banned_rights = getattr(entity, 'banned_rights', None)
+    if banned_rights and getattr(banned_rights, 'send_messages', False):
+        return True, "Muted by group admin"
+    default_rights = getattr(entity, 'default_banned_rights', None)
+    admin_rights = getattr(entity, 'admin_rights', None)
+    if default_rights and getattr(default_rights, 'send_messages', False) and not admin_rights:
+        return True, "Group write permissions closed"
+    return False, None
+
+
 async def run_broadcast(client, uid, account_ids=None):
     """
     Run the broadcast loop.
@@ -748,10 +764,17 @@ async def run_broadcast(client, uid, account_ids=None):
                     except Exception as e:
                         logger.info(f"Account {acc['phone_number']} already in channel or join skipped: {e}")
 
-                # Fetch active groups (limit=100 for fast startup)
+                # Fetch active groups and automatically leave any muted/banned groups
                 cached_groups = []
                 async for dialog in tg_client.iter_dialogs(limit=100):
                     if dialog.is_group:
+                        # Automated check: if account is muted, banned, or write-forbidden, leave immediately
+                        is_restr, restr_reason = check_entity_restricted(dialog.entity)
+                        if is_restr:
+                            logger.info(f"Account {acc['phone_number']} auto-leaving restricted/muted group {dialog.name} ({dialog.id}): {restr_reason}")
+                            await safe_leave_group(tg_client, dialog.id, user_id=uid)
+                            continue
+
                         norm_id = normalize_tg_id(dialog.id)
                         if normalized_group_ids is None or norm_id in normalized_group_ids or dialog.id in (group_ids or []):
                             if dialog.id in skip_group_ids or norm_id in skip_group_ids:
@@ -764,6 +787,10 @@ async def run_broadcast(client, uid, account_ids=None):
                     logger.info(f"No groups matched filter for {acc['phone_number']}, falling back to active group dialogs")
                     async for dialog in tg_client.iter_dialogs(limit=100):
                         if dialog.is_group:
+                            is_restr, restr_reason = check_entity_restricted(dialog.entity)
+                            if is_restr:
+                                await safe_leave_group(tg_client, dialog.id, user_id=uid)
+                                continue
                             norm_id = normalize_tg_id(dialog.id)
                             if dialog.id in skip_group_ids or norm_id in skip_group_ids:
                                 continue
