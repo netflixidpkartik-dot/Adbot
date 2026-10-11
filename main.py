@@ -868,6 +868,234 @@ def check_entity_restricted(entity):
     return False, False, None
 
 
+async def ensure_groups_folder(tg_client, new_peers=None):
+    """
+    Ensure a chat folder (dialog filter) named 'groups' exists on the account,
+    and includes all group chats and newly joined peers.
+    """
+    try:
+        from telethon.tl.functions.messages import GetDialogFiltersRequest, UpdateDialogFilterRequest
+        from telethon.tl.types import DialogFilter, TextWithEntities
+
+        res = await tg_client(GetDialogFiltersRequest())
+        filters = getattr(res, 'filters', res) if res else []
+        target_filter = None
+        existing_ids = set()
+
+        for f in filters:
+            fid = getattr(f, 'id', None)
+            if fid is not None:
+                existing_ids.add(fid)
+            title_obj = getattr(f, 'title', None)
+            t_str = getattr(title_obj, 'text', str(title_obj)) if hasattr(title_obj, 'text') else str(title_obj)
+            if t_str and t_str.strip().lower() in ('groups', 'group'):
+                target_filter = f
+                break
+
+        input_peers_to_add = []
+        if new_peers:
+            for p in new_peers:
+                try:
+                    inp = await tg_client.get_input_entity(p)
+                    input_peers_to_add.append(inp)
+                except Exception:
+                    pass
+
+        if target_filter and isinstance(target_filter, DialogFilter):
+            inc_peers = list(getattr(target_filter, 'include_peers', []))
+            inc_peer_ids = set()
+            for ip in inc_peers:
+                inc_peer_ids.add(getattr(ip, 'channel_id', getattr(ip, 'chat_id', getattr(ip, 'user_id', None))))
+
+            added = False
+            for ip in input_peers_to_add:
+                pid = getattr(ip, 'channel_id', getattr(ip, 'chat_id', getattr(ip, 'user_id', None)))
+                if pid and pid not in inc_peer_ids:
+                    inc_peers.append(ip)
+                    inc_peer_ids.add(pid)
+                    added = True
+
+            if added or not getattr(target_filter, 'groups', False):
+                target_filter.include_peers = inc_peers
+                target_filter.groups = True
+                await tg_client(UpdateDialogFilterRequest(id=target_filter.id, filter=target_filter))
+                logger.info(f"Updated 'groups' folder filter (ID {target_filter.id}) on account")
+
+        elif not target_filter:
+            free_id = 2
+            while free_id in existing_ids:
+                free_id += 1
+
+            new_filter = DialogFilter(
+                id=free_id,
+                title=TextWithEntities(text="groups", entities=[]),
+                pinned_peers=[],
+                include_peers=input_peers_to_add,
+                exclude_peers=[],
+                groups=True,
+                broadcasts=False,
+                bots=False,
+                contacts=False,
+                non_contacts=False
+            )
+            await tg_client(UpdateDialogFilterRequest(id=free_id, filter=new_filter))
+            logger.info(f"Created new 'groups' folder filter (ID {free_id}) on account")
+
+    except Exception as e:
+        logger.debug(f"Could not ensure 'groups' dialog filter: {e}")
+
+
+async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, max_joins=2):
+    """
+    Gradually join 2-3 target groups per account per cycle safely:
+    - Avoids bulk join penalties and Telegram FloodWait.
+    - Adds every joined group to the 'groups' chat folder (dialog filter).
+    - Permanently mutes all joined groups.
+    - Automatically updates user's target groups and account group cache.
+    """
+    try:
+        already_joined_keys = db.get_account_joined_targets(acc_id)
+        raw_links = getattr(config, 'DEFAULT_GROUP_LINKS', [])
+        if not raw_links:
+            return 0
+
+        all_links_text = "\n".join(raw_links)
+        folder_slugs = re.findall(r'(?:t\.me/addlist/|tg://addlist\?slug=)([a-zA-Z0-9_-]+)', all_links_text)
+        invite_hashes = re.findall(r'(?:t\.me/(?:\+|joinchat/))([a-zA-Z0-9_-]+)', all_links_text)
+        usernames = re.findall(r'(?:(?:https?://)?t\.me/|@)([a-zA-Z0-9_]{4,32})', all_links_text)
+        usernames = [u for u in usernames if u.lower() not in ('addlist', 'joinchat', 'c', 'share', 'contact') and u not in folder_slugs and u not in invite_hashes]
+
+        pending_targets = []
+        for s in folder_slugs:
+            key = f"slug:{s}"
+            if key not in already_joined_keys:
+                pending_targets.append(("slug", s, key))
+        for h in invite_hashes:
+            key = f"hash:{h}"
+            if key not in already_joined_keys:
+                pending_targets.append(("hash", h, key))
+        for u in usernames:
+            key = f"user:{u.lower()}"
+            if key not in already_joined_keys:
+                pending_targets.append(("user", u, key))
+
+        if not pending_targets:
+            return 0
+
+        joined_this_cycle = 0
+        newly_joined_peers = []
+        mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
+
+        for target_type, target_val, target_key in pending_targets:
+            if joined_this_cycle >= max_joins:
+                break
+            try:
+                if target_type == "slug":
+                    try:
+                        invite = await tg_client(chatlists.CheckChatlistInviteRequest(slug=target_val))
+                        if isinstance(invite, chatlist_types.ChatlistInvite):
+                            inp_peers = []
+                            chats_list = getattr(invite, 'chats', [])
+                            for ch in chats_list:
+                                try:
+                                    inp_peers.append(await tg_client.get_input_entity(ch))
+                                    db.add_target_group(uid, ch.id, getattr(ch, 'title', str(ch.id)))
+                                except Exception:
+                                    pass
+                            if not inp_peers:
+                                for p in getattr(invite, 'peers', []):
+                                    try:
+                                        inp_peers.append(await tg_client.get_input_entity(p))
+                                    except Exception:
+                                        pass
+                            if inp_peers:
+                                try:
+                                    await tg_client(chatlists.JoinChatlistInviteRequest(slug=target_val, peers=inp_peers))
+                                except Exception:
+                                    for p in inp_peers:
+                                        try:
+                                            await tg_client(functions.channels.JoinChannelRequest(channel=p))
+                                        except Exception:
+                                            pass
+                                for p in inp_peers:
+                                    try:
+                                        await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p), settings=mute_settings))
+                                    except Exception:
+                                        pass
+                                newly_joined_peers.extend(inp_peers)
+                                joined_this_cycle += 1
+                                logger.info(f"Auto-Join: Account {phone} joined folder {target_val} ({len(inp_peers)} groups)")
+                        elif isinstance(invite, chatlist_types.ChatlistInviteAlready):
+                            logger.info(f"Auto-Join: Account {phone} already in folder {target_val}")
+                    except Exception as sl_err:
+                        logger.warning(f"Auto-join folder slug error for {phone} ({target_val}): {sl_err}")
+                    db.record_account_joined_target(acc_id, target_key)
+
+                elif target_type == "hash":
+                    try:
+                        res = await tg_client(functions.messages.ImportChatInviteRequest(hash=target_val))
+                        chats = getattr(res, 'chats', [])
+                        for c in chats:
+                            db.add_target_group(uid, c.id, getattr(c, 'title', str(c.id)))
+                            try:
+                                inp = await tg_client.get_input_entity(c)
+                                await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
+                                newly_joined_peers.append(inp)
+                            except Exception:
+                                pass
+                        joined_this_cycle += 1
+                        logger.info(f"Auto-Join: Account {phone} joined invite hash +{target_val}")
+                    except UserAlreadyParticipantError:
+                        logger.info(f"Auto-Join: Account {phone} already participant in +{target_val}")
+                    except Exception as h_err:
+                        err_str = str(h_err).lower()
+                        if "already" in err_str:
+                            logger.info(f"Auto-Join: Account {phone} already participant in +{target_val}")
+                        else:
+                            raise h_err
+                    db.record_account_joined_target(acc_id, target_key)
+
+                elif target_type == "user":
+                    try:
+                        entity = await tg_client.get_entity(target_val)
+                        await tg_client(functions.channels.JoinChannelRequest(channel=entity))
+                        db.add_target_group(uid, entity.id, getattr(entity, 'title', target_val))
+                        try:
+                            inp = await tg_client.get_input_entity(entity)
+                            await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
+                            newly_joined_peers.append(inp)
+                        except Exception:
+                            pass
+                        joined_this_cycle += 1
+                        logger.info(f"Auto-Join: Account {phone} joined @{target_val}")
+                    except UserAlreadyParticipantError:
+                        logger.info(f"Auto-Join: Account {phone} already participant in @{target_val}")
+                    except Exception as u_err:
+                        err_str = str(u_err).lower()
+                        if "already" in err_str:
+                            logger.info(f"Auto-Join: Account {phone} already participant in @{target_val}")
+                        else:
+                            raise u_err
+                    db.record_account_joined_target(acc_id, target_key)
+
+                await asyncio.sleep(random.uniform(8.0, 15.0))
+
+            except FloodWaitError as fe:
+                logger.warning(f"Auto-Join FloodWait {fe.seconds}s for {phone}. Pausing auto-joins for this cycle.")
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                logger.warning(f"Auto-Join error on {target_key} for {phone}: {e}")
+                if any(k in err_str for k in ("expired", "invalid", "not found", "username_not_occupied", "invite_hash_expired", "channel_private", "channels_too_much")):
+                    db.record_account_joined_target(acc_id, target_key)
+
+        await ensure_groups_folder(tg_client, newly_joined_peers)
+        return joined_this_cycle
+    except Exception as e:
+        logger.error(f"Error in auto_join_gradual_groups_for_account for {phone}: {e}")
+        return 0
+
+
 async def run_broadcast(client, uid, account_ids=None):
     """
     Run the broadcast loop.
@@ -1473,6 +1701,33 @@ async def run_broadcast(client, uid, account_ids=None):
                     except Exception as scan_err:
                         logger.error(f"Post-cycle maintenance error for {p_num}: {scan_err}")
 
+                # 4. Automated Gradual Group Auto-Joiner (joins 2-3 target groups per account per cycle into 'groups' folder)
+                maint_groups_auto_joined = 0
+                for aid in list(clients.keys()):
+                    if not db.get_broadcast_state(uid).get("running", False):
+                        break
+                    if aid in banned_accounts or aid in spambot_restricted_accounts:
+                        continue
+                    tg_c, s_str, p_num = clients[aid]
+                    try:
+                        n_joined = await auto_join_gradual_groups_for_account(tg_c, p_num, uid, aid, max_joins=2)
+                        if n_joined > 0:
+                            maint_groups_auto_joined += n_joined
+                            # Refresh active groups in group_cache so newly joined groups are posted to in next cycle!
+                            updated_grps = []
+                            async for dlg in tg_c.iter_dialogs(limit=100):
+                                if dlg.is_group:
+                                    is_r, should_l, _ = check_entity_restricted(dlg.entity)
+                                    if not is_r:
+                                        norm_id = normalize_tg_id(dlg.id)
+                                        if normalized_group_ids is None or norm_id in normalized_group_ids or dlg.id in (group_ids or []):
+                                            if dlg.id not in skip_group_ids and norm_id not in skip_group_ids:
+                                                updated_grps.append((dlg.id, dlg.name))
+                            random.shuffle(updated_grps)
+                            group_cache[aid] = updated_grps
+                    except Exception as aj_err:
+                        logger.warning(f"Gradual join error for {p_num}: {aj_err}")
+
                 # Send summary DM notification if any maintenance actions occurred
                 maint_summary = []
                 if maint_channels_left > 0:
@@ -1483,6 +1738,8 @@ async def run_broadcast(client, uid, account_ids=None):
                     maint_summary.append(f"• Removed {maint_sessions_deleted} terminated session(s)")
                 if maint_accounts_recovered > 0:
                     maint_summary.append(f"• Resumed {maint_accounts_recovered} SpamBot-recovered account(s)")
+                if maint_groups_auto_joined > 0:
+                    maint_summary.append(f"• Auto-joined {maint_groups_auto_joined} target group(s) into 'groups' folder 📁🔕")
 
                 if maint_summary:
                     await send_dm_log(
@@ -2461,12 +2718,14 @@ async def join_folder_saved_all_cb(client, cb):
     if not accounts:
         await cb.answer("No accounts available!", show_alert=True)
         return
+    default_links = getattr(config, 'DEFAULT_GROUP_LINKS', [])
     perm_folder = getattr(config, 'PERMANENT_GROUP_FOLDER', '')
-    if not perm_folder:
-        await cb.answer("No saved permanent folder configured!", show_alert=True)
+    payload = "\n".join(default_links) if default_links else perm_folder
+    if not payload:
+        await cb.answer("No saved links/folders configured!", show_alert=True)
         return
-    await cb.answer("Joining saved folder for all accounts...")
-    await perform_join_folder(client, uid, perm_folder, account_ids=None)
+    await cb.answer("Joining saved folders & groups for all accounts...")
+    await perform_join_folder(client, uid, payload, account_ids=None)
 
 
 @pyro.on_callback_query(filters.regex(r"^join_folder_all$"))
@@ -2510,12 +2769,14 @@ async def join_folder_saved_single_cb(client, cb):
     if not account:
         await cb.answer("Account not found!", show_alert=True)
         return
+    default_links = getattr(config, 'DEFAULT_GROUP_LINKS', [])
     perm_folder = getattr(config, 'PERMANENT_GROUP_FOLDER', '')
-    if not perm_folder:
-        await cb.answer("No saved permanent folder configured!", show_alert=True)
+    payload = "\n".join(default_links) if default_links else perm_folder
+    if not payload:
+        await cb.answer("No saved links/folders configured!", show_alert=True)
         return
-    await cb.answer("Joining saved folder for this account...")
-    await perform_join_folder(client, uid, perm_folder, account_ids=[acc_id])
+    await cb.answer("Joining saved folders & groups for this account...")
+    await perform_join_folder(client, uid, payload, account_ids=[acc_id])
 
 
 @pyro.on_callback_query(filters.regex(r"^join_folder_acc_"))
@@ -2558,14 +2819,17 @@ async def join_folder_single_cb(client, cb):
 async def perform_join_folder(client, uid, input_text, account_ids=None):
     input_text = input_text.strip()
 
-    slug_match = re.search(r'(?:t\.me/addlist/|tg://addlist\?slug=)([a-zA-Z0-9_-]+)', input_text)
-    folder_slug = slug_match.group(1) if slug_match else None
+    folder_slugs = list(dict.fromkeys(re.findall(r'(?:t\.me/addlist/|tg://addlist\?slug=)([a-zA-Z0-9_-]+)', input_text)))
+    invite_hashes = list(dict.fromkeys(re.findall(r'(?:t\.me/(?:\+|joinchat/))([a-zA-Z0-9_-]+)', input_text)))
+    raw_usernames = re.findall(r'(?:(?:https?://)?t\.me/|@)([a-zA-Z0-9_]{4,32})', input_text)
+    usernames = list(dict.fromkeys([
+        u for u in raw_usernames
+        if u.lower() not in ('addlist', 'joinchat', 'c', 'share', 'contact')
+        and u not in folder_slugs
+        and u not in invite_hashes
+    ]))
 
-    invite_hashes = re.findall(r'(?:t\.me/(?:\+|joinchat/))([a-zA-Z0-9_-]+)', input_text)
-    usernames = re.findall(r'(?:(?:https?://)?t\.me/|@)([a-zA-Z0-9_]{4,32})', input_text)
-    usernames = [u for u in usernames if u.lower() not in ('addlist', 'joinchat', 'c', 'share', 'contact')]
-
-    if not folder_slug and not invite_hashes and not usernames:
+    if not folder_slugs and not invite_hashes and not usernames:
         await client.send_message(
             uid,
             "<blockquote><b>❌ Invalid Link!</b></blockquote>\n\n"
@@ -2594,15 +2858,13 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
 
     status_msg = await client.send_message(
         uid,
-        f"⏳ <b>Starting Group Join across {len(targets)} account(s)...</b>\n\n"
+        f"⏳ <b>Starting Group/Folder Join across {len(targets)} account(s)...</b>\n\n"
         f"<i>Connecting accounts and joining chats. Please wait...</i>",
         parse_mode=ParseMode.HTML
     )
 
     success_list = []
     fail_list = []
-    folder_info_title = None
-    folder_chats_count = 0
 
     for idx, acc in enumerate(targets, 1):
         phone = acc.get('phone_number', 'Unknown')
@@ -2624,80 +2886,65 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                 fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Session logged out / removed from bot")
                 continue
 
-            if folder_slug:
+            account_joined_count = 0
+            account_muted_count = 0
+            newly_joined_peers = []
+            mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
+
+            # 1. Process Folders
+            for slug in folder_slugs:
+                target_key = f"slug:{slug}"
                 try:
-                    invite = await tg_client(chatlists.CheckChatlistInviteRequest(slug=folder_slug))
-
+                    invite = await tg_client(chatlists.CheckChatlistInviteRequest(slug=slug))
                     if isinstance(invite, chatlist_types.ChatlistInvite):
-                        if not folder_info_title and hasattr(invite, 'title'):
-                            folder_info_title = getattr(invite.title, 'text', str(invite.title)) if hasattr(invite.title, 'text') else str(invite.title)
-
-                        input_peers = []
+                        inp_peers = []
                         chats_list = getattr(invite, 'chats', [])
-                        folder_chats_count = len(chats_list)
                         for ch in chats_list:
                             try:
-                                input_peers.append(await tg_client.get_input_entity(ch))
+                                inp_peers.append(await tg_client.get_input_entity(ch))
                                 db.add_target_group(uid, ch.id, getattr(ch, 'title', str(ch.id)))
                             except Exception:
                                 pass
-
-                        if not input_peers:
+                        if not inp_peers:
                             for p in getattr(invite, 'peers', []):
                                 try:
-                                    input_peers.append(await tg_client.get_input_entity(p))
+                                    inp_peers.append(await tg_client.get_input_entity(p))
                                 except Exception:
                                     pass
 
-                        if input_peers:
+                        if inp_peers:
                             try:
-                                await tg_client(chatlists.JoinChatlistInviteRequest(
-                                    slug=folder_slug,
-                                    peers=input_peers
-                                ))
+                                await tg_client(chatlists.JoinChatlistInviteRequest(slug=slug, peers=inp_peers))
                             except Exception as e:
                                 logger.warning(f"JoinChatlistInviteRequest error: {e}, falling back to JoinChannel")
-                                for p in input_peers:
+                                for p in inp_peers:
                                     try:
                                         await tg_client(functions.channels.JoinChannelRequest(channel=p))
                                     except Exception:
                                         pass
 
-                            mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
-                            muted_count = 0
-                            for p in input_peers:
+                            for p in inp_peers:
                                 try:
                                     await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p), settings=mute_settings))
-                                    muted_count += 1
+                                    account_muted_count += 1
                                 except Exception:
                                     pass
-                            success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ Joined {len(input_peers)} groups & muted {muted_count} 🔕")
-                        else:
-                            success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ℹ️ Folder empty or already joined")
+                            newly_joined_peers.extend(inp_peers)
+                            account_joined_count += len(inp_peers)
+                        db.record_account_joined_target(acc_id, target_key)
 
                     elif isinstance(invite, chatlist_types.ChatlistInviteAlready):
                         all_chats = getattr(invite, 'chats', [])
-                        # Register all folder chats in DB
                         for ch in all_chats:
                             try:
                                 db.add_target_group(uid, ch.id, getattr(ch, 'title', str(ch.id)))
-                            except Exception:
-                                pass
-
-                        mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
-                        # Mute all chats in the folder
-                        muted_count = 0
-                        for ch in all_chats:
-                            try:
                                 p = await tg_client.get_input_entity(ch)
                                 await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p), settings=mute_settings))
-                                muted_count += 1
+                                account_muted_count += 1
                             except Exception:
                                 pass
-
                         missing = getattr(invite, 'missing_peers', [])
                         if missing:
-                            joined_count = 0
                             for p in missing:
                                 try:
                                     inp = await tg_client.get_input_entity(p)
@@ -2706,73 +2953,97 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                                             chatlist=InputChatlistDialogFilter(filter_id=invite.filter_id),
                                             peers=[inp]
                                         ))
-                                        joined_count += 1
+                                        account_joined_count += 1
                                     except Exception:
                                         await tg_client(functions.channels.JoinChannelRequest(channel=inp))
-                                        joined_count += 1
+                                        account_joined_count += 1
                                     await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
+                                    account_muted_count += 1
+                                    newly_joined_peers.append(inp)
                                 except Exception as ex:
                                     logger.warning(f"Failed to join missing peer {p}: {ex}")
-                            success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ Folder synced ({len(all_chats)} groups, {muted_count} muted 🔕, {joined_count} joined)")
-                        else:
-                            success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ In all {len(all_chats)} folder groups & all {muted_count} muted 🔕")
-                    else:
-                        success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ℹ️ Processed folder")
-
+                        db.record_account_joined_target(acc_id, target_key)
                 except FloodWaitError as e:
-                    fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ⏳ FloodWait ({e.seconds}s)")
-                except ChannelsTooMuchError:
-                    fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ 500-group limit reached")
-                except InviteHashExpiredError:
-                    fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Folder link expired / invalid")
+                    logger.warning(f"FloodWait in folder {slug} for {phone}: {e.seconds}s")
+                    break
                 except Exception as e:
-                    fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ {str(e)}")
+                    logger.warning(f"Folder join error for {phone} ({slug}): {e}")
 
-            else:
-                joined = 0
-                mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
-                for h in invite_hashes:
-                    try:
-                        res = await tg_client(functions.messages.ImportChatInviteRequest(hash=h))
-                        chats = getattr(res, 'chats', [])
-                        for c in chats:
-                            db.add_target_group(uid, c.id, getattr(c, 'title', str(c.id)))
-                            try:
-                                inp = await tg_client.get_input_entity(c)
-                                await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
-                            except Exception:
-                                pass
-                        joined += 1
-                        await asyncio.sleep(1)
-                    except UserAlreadyParticipantError:
-                        joined += 1
-                    except Exception as e:
-                        logger.info(f"Join hash error for {phone}: {e}")
-
-                for u in usernames:
-                    try:
-                        entity = await tg_client.get_entity(u)
-                        await tg_client(functions.channels.JoinChannelRequest(channel=entity))
-                        db.add_target_group(uid, entity.id, getattr(entity, 'title', u))
+            # 2. Process Invite Hashes
+            for h in invite_hashes:
+                target_key = f"hash:{h}"
+                try:
+                    res = await tg_client(functions.messages.ImportChatInviteRequest(hash=h))
+                    chats = getattr(res, 'chats', [])
+                    for c in chats:
+                        db.add_target_group(uid, c.id, getattr(c, 'title', str(c.id)))
                         try:
-                            inp = await tg_client.get_input_entity(entity)
+                            inp = await tg_client.get_input_entity(c)
                             await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
+                            account_muted_count += 1
+                            newly_joined_peers.append(inp)
                         except Exception:
                             pass
-                        joined += 1
-                        await asyncio.sleep(1)
-                    except UserAlreadyParticipantError:
-                        joined += 1
-                    except Exception as e:
-                        logger.info(f"Join username error for {phone}: {e}")
+                    account_joined_count += 1
+                    db.record_account_joined_target(acc_id, target_key)
+                    await asyncio.sleep(1)
+                except UserAlreadyParticipantError:
+                    account_joined_count += 1
+                    db.record_account_joined_target(acc_id, target_key)
+                except FloodWaitError as e:
+                    logger.warning(f"FloodWait in hash +{h} for {phone}: {e.seconds}s")
+                    break
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already" in err_str:
+                        account_joined_count += 1
+                        db.record_account_joined_target(acc_id, target_key)
+                    elif any(k in err_str for k in ("expired", "invalid")):
+                        db.record_account_joined_target(acc_id, target_key)
+                    logger.info(f"Join hash error for {phone} (+{h}): {e}")
 
-                if joined > 0:
-                    success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ Joined {joined} group(s)")
-                else:
-                    fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Failed to join links")
+            # 3. Process Usernames
+            for u in usernames:
+                target_key = f"user:{u.lower()}"
+                try:
+                    entity = await tg_client.get_entity(u)
+                    await tg_client(functions.channels.JoinChannelRequest(channel=entity))
+                    db.add_target_group(uid, entity.id, getattr(entity, 'title', u))
+                    try:
+                        inp = await tg_client.get_input_entity(entity)
+                        await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
+                        account_muted_count += 1
+                        newly_joined_peers.append(inp)
+                    except Exception:
+                        pass
+                    account_joined_count += 1
+                    db.record_account_joined_target(acc_id, target_key)
+                    await asyncio.sleep(1)
+                except UserAlreadyParticipantError:
+                    account_joined_count += 1
+                    db.record_account_joined_target(acc_id, target_key)
+                except FloodWaitError as e:
+                    logger.warning(f"FloodWait in @{u} for {phone}: {e.seconds}s")
+                    break
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already" in err_str:
+                        account_joined_count += 1
+                        db.record_account_joined_target(acc_id, target_key)
+                    elif any(k in err_str for k in ("invalid", "not found", "username_not_occupied")):
+                        db.record_account_joined_target(acc_id, target_key)
+                    logger.info(f"Join username error for {phone} (@{u}): {e}")
+
+            # 4. Ensure 'groups' folder filter on account
+            await ensure_groups_folder(tg_client, newly_joined_peers)
 
             await tg_client.disconnect()
-            logger.info(f"Finished folder join for {phone}")
+            logger.info(f"Finished group join for {phone}: {account_joined_count} joined/synced, {account_muted_count} muted")
+
+            if account_joined_count > 0 or account_muted_count > 0:
+                success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ Synced {account_joined_count} groups, {account_muted_count} muted 🔕 (organized in 'groups' folder 📁)")
+            else:
+                success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ℹ️ Processed (all targets up to date)")
 
         except Exception as e:
             fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ {str(e)}")
@@ -2789,10 +3060,8 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                 pass
         await asyncio.sleep(1.2)
 
-    folder_title_display = f"📁 <b>Folder:</b> <i>{folder_info_title}</i> ({folder_chats_count} groups)\n" if folder_info_title else ""
     report = (
-        f"<blockquote><b>╰_╯ FOLDER JOIN COMPLETE! ✅</b></blockquote>\n\n"
-        f"{folder_title_display}"
+        f"<blockquote><b>╰_╯ FOLDER & GROUP JOIN COMPLETE! ✅</b></blockquote>\n\n"
         f"<b>Summary:</b>\n"
         f"• Total Accounts: {len(targets)}\n"
         f"• ✅ Success: {len(success_list)}\n"
@@ -2804,14 +3073,14 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
     else:
         report += "\n".join(details[:12]) + f"\n<i>...and {len(details) - 12} more</i>"
 
-    report += "\n\n<i>All joined groups are automatically saved for your ad broadcasting! 🚀</i>"
+    report += "\n\n<i>All groups are automatically muted and organized into your 'groups' chat folder! 🚀</i>"
 
     await status_msg.edit_text(
         report,
         parse_mode=ParseMode.HTML,
         reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
     )
-    await send_dm_log(uid, f"<b>📁 Folder join:</b> {len(success_list)}/{len(targets)} accounts joined.")
+    await send_dm_log(uid, f"<b>📁 Folder & Group join:</b> {len(success_list)}/{len(targets)} accounts processed.")
 
 
 @pyro.on_callback_query(filters.regex(r"^backup_accounts$"))

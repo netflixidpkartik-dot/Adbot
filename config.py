@@ -22,6 +22,39 @@ ADMIN_IDS = [ADMIN_ID] if ADMIN_ID else []
 # Permanent Group Folder Link
 PERMANENT_GROUP_FOLDER = os.getenv("PERMANENT_GROUP_FOLDER", "https://t.me/addlist/Qt31BHYkGgk2MGFl")
 
+# Master Auto-Join Group Links (Folders, Private Invite Links & Public Groups)
+DEFAULT_GROUP_LINKS = [
+    "https://t.me/addlist/oA8W6ECFJV9kNjBl",
+    "https://t.me/addlist/xmTsNdurof8wNDQ1",
+    "https://t.me/All_country_kyc",
+    "https://t.me/xmzf88",
+    "https://t.me/RRYI456456",
+    "https://t.me/GKBNotice",
+    "https://t.me/kevcGroup",
+    "https://t.me/Nigeriagroup1",
+    "https://t.me/ngMessage",
+    "https://t.me/gmailselling01",
+    "https://t.me/AnjoCloud",
+    "https://t.me/escrowbuyingselling",
+    "https://t.me/shakyInfoFi",
+    "https://t.me/usdt_chinaa",
+    "https://t.me/chipperuu",
+    "https://t.me/group_fuyou",
+    "https://t.me/deatamsbunny",
+    "https://t.me/xiaoyangg772",
+    "https://t.me/addlist/gfuBZH23WB00Nzll",
+    "https://t.me/+5awfQBjtDrE4YjQ5",
+    "https://t.me/+4_l5EAm196YzNGNh",
+    "https://t.me/+_kM5DymPn5U2YTNh",
+    "https://t.me/+hjpS3mW9xkhhMmI1",
+    "https://t.me/claudegiftlinkcursor",
+    "https://t.me/GR_UPO",
+    "https://t.me/+l8jV1bsbMq8wMDE1",
+    "https://t.me/admtpo",
+    "https://t.me/asoftwarez",
+    "https://t.me/claudeaino1",
+]
+
 # Image URLs
 START_IMAGE = "https://graph.org/file/9878e0f9785f390f5b5a3-2ae056edc4003b40e2.jpg"
 BROADCAST_IMAGE = "https://graph.org/file/9878e0f9785f390f5b5a3-2ae056edc4003b40e2.jpg"

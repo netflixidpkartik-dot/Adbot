@@ -362,6 +362,29 @@ class EnhancedDatabaseManager:
             logger.error(f"Failed to get account {account_id}: {e}")
             return None
 
+    def get_account_joined_targets(self, account_id):
+        """Get set of target keys already joined by an account."""
+        try:
+            oid = ObjectId(account_id) if isinstance(account_id, str) else account_id
+            doc = self.db.accounts.find_one({"_id": oid}, {"joined_target_keys": 1})
+            return set(doc.get("joined_target_keys", [])) if doc else set()
+        except Exception as e:
+            logger.error(f"Failed to get joined targets for {account_id}: {e}")
+            return set()
+
+    def record_account_joined_target(self, account_id, target_key):
+        """Record that an account has joined a specific target key."""
+        try:
+            oid = ObjectId(account_id) if isinstance(account_id, str) else account_id
+            self.db.accounts.update_one(
+                {"_id": oid},
+                {"$addToSet": {"joined_target_keys": target_key}}
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to record joined target for {account_id}: {e}")
+            return False
+
     def get_user_ad_messages(self, user_id):
         """Fetch all user's ad messages sorted by creation time."""
         try:
