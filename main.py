@@ -265,6 +265,9 @@ ACCOUNT_BAN_ERRORS = (
     "AccountBanned",
     "SpamBot",
     "PeerFlood",
+    "banned from sending messages in supergroups",
+    "banned from sending messages in supergroups/channels",
+    "banned from sending messages",
 )
 
 # Group-level restrictions (the group muted the account, write permissions disabled, or admin-only)
@@ -948,21 +951,31 @@ async def run_broadcast(client, uid, account_ids=None):
 
                             except Exception as e:
                                 err_str = str(e)
-                                logger.error(f"Failed send to {gid} via {phone}: {err_str}")
+                                err_type = type(e).__name__
+                                err_full = f"{err_type}: {err_str}"
+                                logger.error(f"Failed send to {gid} via {phone}: {err_full}")
                                 async with stats_lock:
                                     failed_count += 1
                                     db.increment_broadcast_stats(uid, False)
 
-                                # 1. Account-level ban
-                                if any(ban in err_str for ban in ACCOUNT_BAN_ERRORS):
-                                    logger.warning(f"Account {phone} banned/restricted: {err_str}")
-                                    db.deactivate_account(acc_id)
+                                # 1. Account-level ban or Telegram SpamBot restriction
+                                if any(ban.lower() in err_full.lower() for ban in ACCOUNT_BAN_ERRORS):
+                                    logger.warning(f"Account {phone} banned/restricted: {err_full}")
                                     banned_accounts.add(acc_id)
-                                    await send_dm_log(uid, f"<b>🚫 Account deactivated (banned/restricted):</b> <code>{phone}</code>\n<i>{err_str}</i>")
+                                    if "banned from sending messages" in err_full.lower():
+                                        await send_dm_log(
+                                            uid,
+                                            f"<b>⚠️ Account Spam-Restricted by Telegram:</b> <code>{phone}</code>\n"
+                                            f"<i>Telegram SpamBot has temporarily blocked this phone from posting in supergroups/channels.</i>\n"
+                                            f"<i>💡 Check @SpamBot on this number to see expiry time. Broadcasting paused for this account.</i>"
+                                        )
+                                    else:
+                                        db.deactivate_account(acc_id)
+                                        await send_dm_log(uid, f"<b>🚫 Account deactivated (session expired/banned):</b> <code>{phone}</code>\n<i>{err_str}</i>")
                                     return
 
                                 # 2. Group-level restriction (muted, write forbidden, admin only, etc.)
-                                if any(restr.lower() in err_str.lower() for restr in GROUP_RESTRICTED_ERRORS):
+                                if any(restr.lower() in err_full.lower() for restr in GROUP_RESTRICTED_ERRORS):
                                     logger.info(f"Group {group_name} ({gid}) is restricted/muted for {phone}. Auto-exiting group...")
                                     await safe_leave_group(tg_client, gid, user_id=uid)
                                     # Remove from this account's cache and assigned list
