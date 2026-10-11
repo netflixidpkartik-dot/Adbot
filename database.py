@@ -329,6 +329,18 @@ class EnhancedDatabaseManager:
             logger.error(f"Failed to deactivate account {account_id}: {e}")
             raise
 
+    def update_account_name(self, account_id, first_name, last_name=""):
+        """Update stored profile name for an account."""
+        try:
+            self.db.accounts.update_one(
+                {"_id": ObjectId(account_id)},
+                {"$set": {"first_name": first_name or "", "last_name": last_name or "", "name_updated_at": datetime.now()}}
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update account name for {account_id}: {e}")
+            return False
+
     def update_account_bio(self, account_id, bio):
         """Update stored bio for an account."""
         try:

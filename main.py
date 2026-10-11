@@ -85,6 +85,18 @@ def validate_phone_number(phone):
     return bool(re.match(pattern, phone))
 
 
+def get_account_display_name(acc):
+    """Return friendly profile name for an account, falling back to phone number."""
+    if not acc:
+        return "Unknown Account"
+    fn = (acc.get("first_name") or "").strip()
+    ln = (acc.get("last_name") or "").strip()
+    full_name = f"{fn} {ln}".strip()
+    if full_name:
+        return full_name
+    return acc.get("phone_number") or "Unknown Account"
+
+
 def entities_to_dict(entities):
     """Serialize Pyrogram message entities to plain-Python dicts safe for MongoDB."""
     if not entities:
@@ -974,6 +986,17 @@ async def run_broadcast(client, uid, account_ids=None):
                     await send_dm_log(uid, f"<b>🗑️ Session Terminated / Logged Out:</b> Account <code>{acc['phone_number']}</code> was logged out from Telegram Devices and has been automatically removed from the bot.")
                     continue
 
+                # Ensure account profile name is synced in MongoDB
+                if not acc.get('first_name'):
+                    try:
+                        me = await tg_client.get_me()
+                        if me:
+                            db.update_account_name(acc['_id'], me.first_name or '', me.last_name or '')
+                            acc['first_name'] = me.first_name or ''
+                            acc['last_name'] = me.last_name or ''
+                    except Exception:
+                        pass
+
                 # Auto-join the ad source channel if not already in it
                 if config.AD_SOURCE_CHANNEL:
                     try:
@@ -1627,10 +1650,13 @@ async def otp_callback(client, cb):
                 await tg.connect()
                 await tg.sign_in(phone, code=otp, phone_code_hash=phone_code_hash)
 
+                me = await tg.get_me()
+                first_name = getattr(me, 'first_name', '') or ''
+                last_name = getattr(me, 'last_name', '') or ''
                 saved_session = tg.session.save()
                 await tg.disconnect()
                 session_encrypted = cipher_suite.encrypt(saved_session.encode()).decode()
-                db.add_user_account(uid, phone, session_encrypted)
+                db.add_user_account(uid, phone, session_encrypted, first_name=first_name, last_name=last_name)
 
                 await cb.message.edit_caption(
                     f"<blockquote><b>Account Successfully added!✅</b></blockquote>\n\n"
@@ -1993,9 +2019,11 @@ async def view_accounts(client, cb):
         buttons = []
         for i, acc in enumerate(accounts, 1):
             status = "Active ✅" if acc['is_active'] else "Inactive ❌"
-            caption += f"{i}. <code>{acc['phone_number']}</code> - <i>{status}</i>\n"
+            acc_name = get_account_display_name(acc)
+            phone = acc.get('phone_number', '')
+            caption += f"{i}. <b>{acc_name}</b> (<code>{phone}</code>) - <i>{status}</i>\n"
             buttons.append([
-                InlineKeyboardButton(f"{acc['phone_number']} ({status})", callback_data=f"view_acc_{acc['_id']}"),
+                InlineKeyboardButton(f"{acc_name} ({status})", callback_data=f"view_acc_{acc['_id']}"),
                 InlineKeyboardButton("Delete", callback_data=f"delete_acc_{acc['_id']}")
             ])
         
@@ -2047,8 +2075,10 @@ async def delete_accounts(client, cb):
         buttons = []
         for i, acc in enumerate(accounts, 1):
             status = "Active ✅" if acc['is_active'] else "Inactive ❌"
-            caption += f"{i}. <code>{acc['phone_number']}</code> - <i>{status}</i>\n"
-            buttons.append([InlineKeyboardButton(f"Delete {acc['phone_number']}", callback_data=f"delete_acc_{acc['_id']}")])
+            acc_name = get_account_display_name(acc)
+            phone = acc.get('phone_number', '')
+            caption += f"{i}. <b>{acc_name}</b> (<code>{phone}</code>) - <i>{status}</i>\n"
+            buttons.append([InlineKeyboardButton(f"Delete {acc_name}", callback_data=f"delete_acc_{acc['_id']}")])
         
         buttons.append([InlineKeyboardButton("Delete All Accounts ⚠️", callback_data="delete_all_accounts")])
         buttons.append([InlineKeyboardButton("Back 🔙", callback_data="view_accounts")])
@@ -2100,8 +2130,10 @@ async def view_account(client, cb):
     
     status = "Active ✅" if account.get('is_active') else "Inactive ⭕"
     current_bio = account.get('bio', 'Not set')
+    acc_name = get_account_display_name(account)
     caption = (
         f"<blockquote><b>╰_╯ACCOUNT DETAILS</b></blockquote>\n\n"
+        f"• <b>Name:</b> <b>{acc_name}</b>\n"
         f"• <b>Phone:</b> <code>{account['phone_number']}</code>\n"
         f"• <b>Status:</b> {status}\n"
         f"• <b>Bio:</b> <code>{current_bio}</code>\n\n"
@@ -2147,9 +2179,9 @@ async def change_bio_menu(client, cb):
     
     row = []
     for acc in accounts:
-        phone = acc.get("phone_number", "Acc")
+        acc_name = get_account_display_name(acc)
         acc_id = str(acc["_id"])
-        row.append(InlineKeyboardButton(f"✏️ {phone}", callback_data=f"edit_bio_acc_{acc_id}"))
+        row.append(InlineKeyboardButton(f"✏️ {acc_name}", callback_data=f"edit_bio_acc_{acc_id}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -2399,9 +2431,9 @@ async def join_folder_menu(client, cb):
 
     row = []
     for acc in accounts:
-        phone = acc.get("phone_number", "Acc")
+        acc_name = get_account_display_name(acc)
         acc_id = str(acc["_id"])
-        row.append(InlineKeyboardButton(f"📁 {phone}", callback_data=f"join_folder_acc_{acc_id}"))
+        row.append(InlineKeyboardButton(f"📁 {acc_name}", callback_data=f"join_folder_acc_{acc_id}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -3258,12 +3290,12 @@ def _build_account_selection_menu(accounts, selected_ids):
     buttons = []
     for acc in accounts:
         acc_id = str(acc['_id'])
-        phone = acc['phone_number']
+        acc_name = get_account_display_name(acc)
         is_on = acc_id in selected_ids
         status_icon = "✅" if is_on else "⬜"
         buttons.append([
             InlineKeyboardButton(
-                f"{status_icon} {phone}",
+                f"{status_icon} {acc_name}",
                 callback_data=f"toggle_bcast_acc_{acc_id}"
             )
         ])
@@ -3429,14 +3461,14 @@ async def start_bcast_selected(client, cb):
         return
 
     accounts = db.get_user_accounts(uid)
-    selected_phones = [
-        acc['phone_number'] for acc in accounts if str(acc['_id']) in selected
+    selected_names = [
+        get_account_display_name(acc) for acc in accounts if str(acc['_id']) in selected
     ]
     await _launch_broadcast(client, uid, account_ids=selected)
 
-    label = ", ".join(selected_phones[:3])
-    if len(selected_phones) > 3:
-        label += f" +{len(selected_phones) - 3} more"
+    label = ", ".join(selected_names[:3])
+    if len(selected_names) > 3:
+        label += f" +{len(selected_names) - 3} more"
 
     try:
         await cb.message.edit_caption(
@@ -4513,9 +4545,13 @@ async def _handle_telethon_password(uid, text, m):
     try:
         await tg.connect()
         await tg.sign_in(password=text)
+        me = await tg.get_me()
+        first_name = getattr(me, 'first_name', '') or ''
+        last_name = getattr(me, 'last_name', '') or ''
         saved_session = tg.session.save()
+        await tg.disconnect()
         session_encrypted = cipher_suite.encrypt(saved_session.encode()).decode()
-        db.add_user_account(uid, phone, session_encrypted)
+        db.add_user_account(uid, phone, session_encrypted, first_name=first_name, last_name=last_name)
         await m.reply(
             f"<blockquote><b>╰_╯Account added!✅ </b></blockquote>\n\n"
             f"<u>Phone:</u> <code>{phone}</code>\n"
