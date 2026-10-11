@@ -476,6 +476,19 @@ async def load_session_from_string(session_str):
     return None, None
 
 
+def normalize_tg_id(gid):
+    """Normalize Telegram group/channel IDs across Pyrogram (-100...) and Telethon formats."""
+    s = str(gid)
+    if s.startswith("-100"):
+        return int(s[4:])
+    elif s.startswith("-"):
+        return int(s[1:])
+    try:
+        return int(s)
+    except Exception:
+        return gid
+
+
 # Invisible Unicode chars to vary message fingerprint so each send is unique
 INVISIBLE_CHARS = ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"]
 
@@ -2089,7 +2102,7 @@ async def view_accounts(client, cb):
         ])
         buttons.append([
             InlineKeyboardButton("🔄 Sync Groups Across Accounts", callback_data="sync_groups_all"),
-            InlineKeyboardButton("🚪 Auto-Leave Muted Groups", callback_data="leave_muted_groups_all")
+            InlineKeyboardButton("🚪 Auto-Leave Muted & Channels", callback_data="leave_muted_groups_all")
         ])
         if is_owner(uid):
             buttons.append([InlineKeyboardButton("📦 Backup All Accounts (Sessions)", callback_data="backup_accounts")])
@@ -2363,6 +2376,7 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
 
     for idx, acc in enumerate(targets, 1):
         phone = acc.get('phone_number', 'Unknown')
+        name = get_account_display_name(acc)
         acc_id = acc['_id']
         tg_client = None
         try:
@@ -2370,7 +2384,7 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
             try:
                 session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
             except Exception as dec_err:
-                fail_list.append(f"• <code>{phone}</code>: ❌ Decrypt error: {str(dec_err)[:60]}")
+                fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Decrypt error: {str(dec_err)[:60]}")
                 logger.error(f"Bio: failed to decrypt session for {phone}: {dec_err}")
                 continue
 
@@ -2385,7 +2399,7 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
             if not await tg_client.is_user_authorized():
                 await tg_client.disconnect()
                 db.delete_user_account(uid, str(acc_id))
-                fail_list.append(f"• <code>{phone}</code>: ❌ Session logged out / removed from bot")
+                fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Session logged out / removed from bot")
                 continue
 
             me = await tg_client.get_me()
@@ -2407,22 +2421,22 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
             tg_client = None
 
             if verified_bio == new_bio.strip() or (not new_bio and not verified_bio):
-                success_list.append(f"• <code>{phone}</code>: ✅ Bio updated & verified")
+                success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ Bio updated & verified")
                 logger.info(f"Bio updated & verified for {phone}: {new_bio}")
             else:
-                success_list.append(f"• <code>{phone}</code>: ⚠️ Saved (Telegram got: '{verified_bio[:30]}')")
+                success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ⚠️ Saved (Telegram got: '{verified_bio[:30]}')")
                 logger.warning(f"Bio discrepancy for {phone}: expected '{new_bio}', got '{verified_bio}'")
         except FloodWaitError as e:
-            fail_list.append(f"• <code>{phone}</code>: ⏳ FloodWait ({e.seconds}s)")
+            fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ⏳ FloodWait ({e.seconds}s)")
             logger.warning(f"FloodWait updating bio for {phone}: {e.seconds}s")
         except AboutTooLongError:
-            fail_list.append(f"• <code>{phone}</code>: ❌ Exceeds 70-character limit")
+            fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Exceeds 70-character limit")
         except Exception as e:
             import traceback
             err_msg = str(e)
             if "about too long" in err_msg.lower():
                 err_msg = "Exceeds 70-character limit"
-            fail_list.append(f"• <code>{phone}</code>: ❌ {err_msg[:80]}")
+            fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ {err_msg[:80]}")
             logger.error(f"Failed to update bio for {phone}: {traceback.format_exc()}")
         finally:
             if tg_client:
@@ -2663,6 +2677,7 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
 
     for idx, acc in enumerate(targets, 1):
         phone = acc.get('phone_number', 'Unknown')
+        name = get_account_display_name(acc)
         acc_id = acc['_id']
         try:
             session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
@@ -2677,7 +2692,7 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
             if not await tg_client.is_user_authorized():
                 await tg_client.disconnect()
                 db.delete_user_account(uid, str(acc_id))
-                fail_list.append(f"• <code>{phone}</code>: ❌ Session logged out / removed from bot")
+                fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Session logged out / removed from bot")
                 continue
 
             if folder_slug:
@@ -2727,9 +2742,9 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                                     muted_count += 1
                                 except Exception:
                                     pass
-                            success_list.append(f"• <code>{phone}</code>: ✅ Joined {len(input_peers)} groups & muted {muted_count} 🔕")
+                            success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ Joined {len(input_peers)} groups & muted {muted_count} 🔕")
                         else:
-                            success_list.append(f"• <code>{phone}</code>: ℹ️ Folder empty or already joined")
+                            success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ℹ️ Folder empty or already joined")
 
                     elif isinstance(invite, chatlist_types.ChatlistInviteAlready):
                         all_chats = getattr(invite, 'chats', [])
@@ -2769,20 +2784,20 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                                     await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
                                 except Exception as ex:
                                     logger.warning(f"Failed to join missing peer {p}: {ex}")
-                            success_list.append(f"• <code>{phone}</code>: ✅ Folder synced ({len(all_chats)} groups, {muted_count} muted 🔕, {joined_count} joined)")
+                            success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ Folder synced ({len(all_chats)} groups, {muted_count} muted 🔕, {joined_count} joined)")
                         else:
-                            success_list.append(f"• <code>{phone}</code>: ✅ In all {len(all_chats)} folder groups & all {muted_count} muted 🔕")
+                            success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ In all {len(all_chats)} folder groups & all {muted_count} muted 🔕")
                     else:
-                        success_list.append(f"• <code>{phone}</code>: ℹ️ Processed folder")
+                        success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ℹ️ Processed folder")
 
                 except FloodWaitError as e:
-                    fail_list.append(f"• <code>{phone}</code>: ⏳ FloodWait ({e.seconds}s)")
+                    fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ⏳ FloodWait ({e.seconds}s)")
                 except ChannelsTooMuchError:
-                    fail_list.append(f"• <code>{phone}</code>: ❌ 500-group limit reached")
+                    fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ 500-group limit reached")
                 except InviteHashExpiredError:
-                    fail_list.append(f"• <code>{phone}</code>: ❌ Folder link expired / invalid")
+                    fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Folder link expired / invalid")
                 except Exception as e:
-                    fail_list.append(f"• <code>{phone}</code>: ❌ {str(e)}")
+                    fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ {str(e)}")
 
             else:
                 joined = 0
@@ -2823,15 +2838,15 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                         logger.info(f"Join username error for {phone}: {e}")
 
                 if joined > 0:
-                    success_list.append(f"• <code>{phone}</code>: ✅ Joined {joined} group(s)")
+                    success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ Joined {joined} group(s)")
                 else:
-                    fail_list.append(f"• <code>{phone}</code>: ❌ Failed to join links")
+                    fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Failed to join links")
 
             await tg_client.disconnect()
             logger.info(f"Finished folder join for {phone}")
 
         except Exception as e:
-            fail_list.append(f"• <code>{phone}</code>: ❌ {str(e)}")
+            fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ {str(e)}")
             logger.error(f"Error during folder join for {phone}: {e}")
 
         if len(targets) > 1 and idx % 2 == 0:
@@ -3065,27 +3080,35 @@ async def sync_groups_all_cb(client, cb):
 
 @pyro.on_callback_query(filters.regex(r"^leave_muted_groups_all$"))
 async def leave_muted_groups_all_cb(client, cb):
-    """Scan all hosted accounts and automatically leave any group where the account is muted, banned, or cannot write."""
+    """Scan all hosted accounts and automatically leave any broadcast channels or groups where the account is permanently muted or cannot write."""
     uid = cb.from_user.id
     accounts = db.get_user_accounts(uid)
     if not accounts:
         await cb.answer("No accounts hosted!", show_alert=True)
         return
 
-    await cb.answer("⏳ Scanning accounts for muted/banned groups...", show_alert=False)
-    
+    await cb.answer("⏳ Scanning accounts for channels & muted groups...", show_alert=False)
+
     status_msg = await cb.message.reply(
         "⏳ <b>Auto-Cleanup Started...</b>\n\n"
-        f"Scanning <b>{len(accounts)}</b> account(s) for muted or banned groups.\n"
-        "<i>Accounts will automatically leave any group they cannot write in. Please wait...</i>",
+        f"Scanning <b>{len(accounts)}</b> account(s) for useless broadcast channels and muted groups.\n"
+        "<i>Accounts will safely exit any channel or permanently muted group. Please wait...</i>",
         parse_mode=ParseMode.HTML
     )
+
+    skip_group_ids = [getattr(config, 'MUSTJOIN_GROUP_ID', None)]
+    protected_channel_usernames = set()
+    if getattr(config, 'AD_SOURCE_CHANNEL', ''):
+        protected_channel_usernames.add(str(config.AD_SOURCE_CHANNEL).lstrip('@').lower())
+    if getattr(config, 'MUST_JOIN_CHANNEL', ''):
+        protected_channel_usernames.add(str(config.MUST_JOIN_CHANNEL).lstrip('@').lower())
 
     total_left = 0
     account_results = []
 
     for acc in accounts:
         phone = acc.get("phone_number", "Unknown")
+        name = get_account_display_name(acc)
         if not acc.get("is_active", True):
             continue
 
@@ -3106,53 +3129,52 @@ async def leave_muted_groups_all_cb(client, cb):
 
             acc_left = 0
             async for dialog in tg_client.iter_dialogs(limit=150):
-                if not dialog.is_group:
-                    continue
-
                 entity = dialog.entity
-                is_restricted = False
-                reason = ""
+                norm_d_id = normalize_tg_id(dialog.id)
 
-                # Check account-specific restriction in this chat
-                if getattr(entity, 'restricted', False):
-                    is_restricted = True
-                    reason = "Account restricted"
-
-                # Check banned rights for member
-                banned_rights = getattr(entity, 'banned_rights', None)
-                if banned_rights and getattr(banned_rights, 'send_messages', False):
-                    is_restricted = True
-                    reason = "Muted from sending messages"
-
-                # Check default banned rights for chat (if chat is restricted for non-admins)
-                default_rights = getattr(entity, 'default_banned_rights', None)
-                admin_rights = getattr(entity, 'admin_rights', None)
-                if default_rights and getattr(default_rights, 'send_messages', False) and not admin_rights:
-                    is_restricted = True
-                    reason = "Group write permissions closed"
-
-                if is_restricted:
+                # 1. Safely auto-leave broadcast channels (non-groups)
+                if dialog.is_channel and not dialog.is_group:
+                    if dialog.id in skip_group_ids or norm_d_id in skip_group_ids:
+                        continue
+                    ch_uname = getattr(entity, 'username', '') or ''
+                    if ch_uname.lower() in protected_channel_usernames or str(dialog.id) == str(config.AD_SOURCE_CHANNEL):
+                        continue
                     left = await safe_leave_group(tg_client, dialog.id, user_id=uid)
                     if left:
                         acc_left += 1
                         total_left += 1
-                        logger.info(f"Account {phone} auto-left {dialog.name} ({dialog.id}): {reason}")
+                        logger.info(f"Account {name} ({phone}) auto-left broadcast channel {dialog.name} ({dialog.id})")
+                        await asyncio.sleep(random.uniform(2.5, 4.0))
+                    continue
+
+                # 2. Safely auto-leave permanent or >48h muted groups (temporary <=48h stays)
+                if dialog.is_group:
+                    is_r, should_l, r_reason = check_entity_restricted(entity)
+                    if is_r and should_l:
+                        left = await safe_leave_group(tg_client, dialog.id, user_id=uid)
+                        if left:
+                            acc_left += 1
+                            total_left += 1
+                            logger.info(f"Account {name} ({phone}) auto-left group {dialog.name} ({dialog.id}): {r_reason}")
+                            await asyncio.sleep(random.uniform(2.5, 4.0))
+                    elif is_r and not should_l:
+                        logger.info(f"Account {name} ({phone}) kept in group {dialog.name} ({dialog.id}): {r_reason}")
 
             await tg_client.disconnect()
-            account_results.append(f"• <code>{phone}</code>: Left <b>{acc_left}</b> muted group(s)")
+            account_results.append(f"• <b>{name}</b> (<code>{phone}</code>): Left <b>{acc_left}</b> group(s)/channel(s)")
 
         except Exception as e:
             logger.error(f"Error checking muted groups for {phone}: {e}")
-            account_results.append(f"• <code>{phone}</code>: ❌ Error ({str(e)[:30]})")
+            account_results.append(f"• <b>{name}</b>: ❌ Error ({str(e)[:30]})")
 
     report = (
         f"<blockquote><b>🚪 AUTO-CLEANUP COMPLETE! ✅</b></blockquote>\n\n"
-        f"<b>Total Muted/Banned Groups Left:</b> <code>{total_left}</code>\n"
+        f"<b>Total Channels & Muted Groups Left:</b> <code>{total_left}</code>\n"
         f"<b>Accounts Scanned:</b> <code>{len(accounts)}</code>\n\n"
         f"<b>Account Details:</b>\n"
     )
     report += "\n".join(account_results[:15])
-    report += "\n\n<i>All muted/restricted groups were cleanly exited to protect account health! 🛡️</i>"
+    report += "\n\n<i>All useless channels and permanent muted groups were cleanly exited to protect account health! 🛡️</i>"
 
     try:
         await status_msg.edit_text(
@@ -3163,7 +3185,7 @@ async def leave_muted_groups_all_cb(client, cb):
     except Exception:
         await cb.message.reply(report, parse_mode=ParseMode.HTML)
 
-    await send_dm_log(uid, f"<b>🚪 Auto-Cleanup:</b> Left {total_left} muted/banned groups across {len(accounts)} accounts.")
+    await send_dm_log(uid, f"<b>🚪 Auto-Cleanup:</b> Left {total_left} channels/muted groups across {len(accounts)} accounts.")
 
 
 @pyro.on_callback_query(filters.regex(r"^set_msg$"))
@@ -3212,6 +3234,7 @@ async def set_msg(client, cb):
         f"2️⃣ <b>Photo Ad:</b> Set 1 photo ad (with or without caption)\n"
         f"3️⃣ <b>Multi-Ad Rotation:</b> Add multiple ads & start ad rotation\n"
         f"4️⃣ <b>Forward Ad:</b> Channel post forward (premium emojis & stickers)\n\n"
+        f"💡 <i>Tip: Use Spin-Tax like <code>{{Best|Top}} {{offers|deals}}</code> for unique variations every post!</i>\n\n"
         f"<i>Select an option below:</i>"
     )
 
