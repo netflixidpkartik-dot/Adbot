@@ -771,130 +771,41 @@ async def check_spambot_status(tg_client):
 
 async def appeal_spambot(tg_client, phone, user_id, acc_id=None):
     """
-    Automatically contact @SpamBot to request unlifting restrictions:
-    1. Send /start to @SpamBot.
-    2. Check response for expiry date / limitation status.
-    3. Click 'This is a mistake' -> 'Yes' -> 'No! Never did that!'.
-    4. Submit complaint text explaining it is a mistake.
-    5. Save expiry timestamp and notify user in DM.
+    Handle SpamBot restricted account without submitting appeals:
+    - SpamBot apply/appeal process is skipped per user instruction.
+    - Queries @SpamBot for limitation expiration date only (no buttons clicked, no complaints sent).
+    - Registers account in spambot_restricted_accounts so it is paused from sending ads.
+    - Notifies admin via DM log.
     """
-    last_time = spambot_appeals_last_time.get(phone, 0)
-    now_ts = time.time()
-    # Don't appeal more than once every 12 hours per account
-    if now_ts - last_time < 12 * 3600:
-        logger.info(f"Account {phone} already appealed to @SpamBot recently. Skipping duplicate appeal.")
-        return
-
-    spambot_appeals_last_time[phone] = now_ts
     try:
-        logger.info(f"Account {phone} starting automated @SpamBot appeal...")
-        spambot = await tg_client.get_entity('SpamBot')
-        await tg_client.send_message(spambot, '/start')
-        await asyncio.sleep(3)
+        logger.info(f"Account {phone} limited. SpamBot apply process is skipped. Pausing ads for this account.")
+        is_restr, exp_ts, spambot_info = await check_spambot_status(tg_client)
 
-        msgs = await tg_client.get_messages(spambot, limit=2)
-        if not msgs:
-            return
-
-        msg = msgs[0]
-        full_text = msg.text or ""
-
-        # Check if free of restrictions
-        if "no limits are currently applied" in full_text.lower() or "good news" in full_text.lower():
-            logger.info(f"Account {phone} is free of restrictions according to @SpamBot.")
+        if not is_restr:
+            logger.info(f"Account {phone} is clean according to @SpamBot.")
             if acc_id and acc_id in spambot_restricted_accounts:
                 del spambot_restricted_accounts[acc_id]
             await send_dm_log(user_id, f"<b>🎉 Account Healthy:</b> <code>{phone}</code> is free of restrictions according to @SpamBot!")
             return
 
-        # Extract expiry date if present
-        expiry_ts = 0
-        expiry_match = re.search(r'until\s+([0-9]+\s+[A-Za-z]+\s+[0-9]{4},\s+[0-9]+:[0-9]+)\s*UTC', full_text, re.IGNORECASE)
-        if expiry_match:
-            expiry_str = f"until {expiry_match.group(1)} UTC"
-            try:
-                dt = datetime.strptime(expiry_match.group(1), '%d %b %Y, %H:%M').replace(tzinfo=timezone.utc)
-                expiry_ts = dt.timestamp()
-            except Exception:
-                pass
-        else:
-            expiry_match_simple = re.search(r'until\s+([0-9]+\s+[A-Za-z]+\s+[0-9]{4}[^.]+)', full_text, re.IGNORECASE)
-            expiry_str = expiry_match_simple.group(1).strip() if expiry_match_simple else "Temporary limitation"
-
         if acc_id:
             spambot_restricted_accounts[acc_id] = {
                 "phone": phone,
-                "expiry_ts": expiry_ts,
+                "expiry_ts": exp_ts,
                 "user_id": user_id
             }
 
-        clicked_action = None
-        if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
-            # Step 1: Look for 'This is a mistake'
-            for r in msg.reply_markup.rows:
-                for b in r.buttons:
-                    if "this is a mistake" in b.text.lower():
-                        clicked_action = "This is a mistake"
-                        await msg.click(text=b.text)
-                        break
-                if clicked_action:
-                    break
-
-            if clicked_action:
-                await asyncio.sleep(3)
-                next_msgs = await tg_client.get_messages(spambot, limit=1)
-                if next_msgs and next_msgs[0].reply_markup and hasattr(next_msgs[0].reply_markup, 'rows'):
-                    n_msg = next_msgs[0]
-                    # Step 2: Click 'Yes'
-                    for r in n_msg.reply_markup.rows:
-                        for b in r.buttons:
-                            if b.text.strip().lower() == "yes":
-                                await n_msg.click(text=b.text)
-                                break
-
-                    await asyncio.sleep(3)
-                    conf_msgs = await tg_client.get_messages(spambot, limit=1)
-                    if conf_msgs and conf_msgs[0].reply_markup and hasattr(conf_msgs[0].reply_markup, 'rows'):
-                        c_msg = conf_msgs[0]
-                        # Step 3: Click 'No! Never did that!'
-                        for r in c_msg.reply_markup.rows:
-                            for b in r.buttons:
-                                if "never did that" in b.text.lower():
-                                    await c_msg.click(text=b.text)
-                                    break
-
-                        await asyncio.sleep(3)
-                        final_msgs = await tg_client.get_messages(spambot, limit=1)
-                        if final_msgs:
-                            f_text = final_msgs[0].text or ""
-                            if "write" in f_text.lower() or "details" in f_text.lower() or "explain" in f_text.lower():
-                                await tg_client.send_message(
-                                    spambot,
-                                    "This is a mistake. I have not violated any rules or sent spam. Please unlift the restrictions on my account."
-                                )
-                                logger.info(f"Account {phone} submitted written appeal explanation to @SpamBot.")
-
-            elif any("release me" in b.text.lower() for r in msg.reply_markup.rows for b in r.buttons):
-                for r in msg.reply_markup.rows:
-                    for b in r.buttons:
-                        if "release me" in b.text.lower():
-                            await msg.click(text=b.text)
-                            clicked_action = b.text
-                            break
-                    if clicked_action:
-                        break
-
+        exp_msg = f"\n• <b>Limitation Period:</b> <code>{spambot_info}</code>" if spambot_info else ""
         await send_dm_log(
             user_id,
-            f"<b>🤖 @SpamBot Appeal Submitted:</b> <code>{phone}</code>\n"
-            f"• <b>Status:</b> Applied to @SpamBot ('This is a mistake')\n"
-            f"• <b>Limitation Period:</b> <code>{expiry_str}</code>\n"
-            f"<i>✅ Requested Telegram to unlift restrictions. Bot will automatically resume this account once restrictions are lifted!</i>"
+            f"<b>⏳ Account Limited:</b> <code>{phone}</code> has been restricted by Telegram (@SpamBot).\n"
+            f"• <b>Action:</b> Paused from sending ads until restriction expires.{exp_msg}\n"
+            f"<i>ℹ️ SpamBot appeal application skipped as requested. Account will be safely re-checked after each cycle and automatically resumed when clean.</i>"
         )
-        logger.info(f"Automated @SpamBot appeal finished for {phone} (Expiry: {expiry_str})")
+        logger.info(f"Account {phone} registered as SpamBot limited ({spambot_info}). Ads paused.")
 
     except Exception as e:
-        logger.error(f"Failed to submit @SpamBot appeal for {phone}: {e}")
+        logger.error(f"Failed to check @SpamBot status for {phone}: {e}")
 
 
 def check_entity_restricted(entity):
@@ -1171,14 +1082,17 @@ async def run_broadcast(client, uid, account_ids=None):
                 # 1. Build list of all distinct target groups across active accounts
                 unique_groups_dict = {}
                 for acc_id, grps in group_cache.items():
-                    if acc_id not in banned_accounts:
+                    if acc_id not in banned_accounts and acc_id not in spambot_restricted_accounts:
                         for gid, gname in grps:
                             unique_groups_dict[gid] = gname
 
                 all_unique_groups = list(unique_groups_dict.items())
                 random.shuffle(all_unique_groups)
 
-                active_acc_keys = [aid for aid in clients.keys() if aid not in banned_accounts]
+                active_acc_keys = [
+                    aid for aid in clients.keys()
+                    if aid not in banned_accounts and aid not in spambot_restricted_accounts
+                ]
                 num_active_accs = len(active_acc_keys)
 
                 # 2. Assign each group to EXACTLY ONE account for this cycle (zero duplicate spam!)
@@ -1259,7 +1173,7 @@ async def run_broadcast(client, uid, account_ids=None):
                                     account_cooldowns[acc_id] = time.time() + wait
                                     available_other = [
                                         aid for aid in active_acc_keys
-                                        if aid != acc_id and aid not in banned_accounts and aid not in flood_waited_accounts
+                                        if aid != acc_id and aid not in banned_accounts and aid not in flood_waited_accounts and aid not in spambot_restricted_accounts
                                     ]
                                     async with group_lock:
                                         remaining = list(assigned_groups.get(acc_id, []))
@@ -1312,13 +1226,28 @@ async def run_broadcast(client, uid, account_ids=None):
                                 if any(ban.lower() in err_full.lower() for ban in ACCOUNT_BAN_ERRORS):
                                     logger.warning(f"Account {phone} banned/restricted: {err_full}")
                                     banned_accounts.add(acc_id)
-                                    if "banned from sending messages" in err_full.lower() or "spambot" in err_full.lower():
-                                        # Register in restricted accounts and appeal to @SpamBot
+                                    if "banned from sending messages" in err_full.lower() or "spambot" in err_full.lower() or "peerflood" in err_full.lower():
+                                        # Register in restricted accounts: do NOT use to send ads!
                                         spambot_restricted_accounts[acc_id] = {
                                             "phone": phone,
                                             "expiry_ts": 0,
                                             "user_id": uid
                                         }
+                                        # Reassign its remaining groups to other active accounts so broadcasting continues smoothly
+                                        available_other = [
+                                            aid for aid in active_acc_keys
+                                            if aid != acc_id and aid not in banned_accounts and aid not in flood_waited_accounts and aid not in spambot_restricted_accounts
+                                        ]
+                                        async with group_lock:
+                                            remaining = list(assigned_groups.get(acc_id, []))
+                                            if gid not in cycle_posted_gids:
+                                                remaining.insert(0, (gid, group_name))
+                                            assigned_groups[acc_id] = []
+                                            if remaining and available_other:
+                                                for r_i, r_g in enumerate(remaining):
+                                                    tgt = available_other[r_i % len(available_other)]
+                                                    assigned_groups[tgt].append(r_g)
+
                                         asyncio.create_task(appeal_spambot(tg_client, phone, uid, acc_id))
                                     else:
                                         db.deactivate_account(acc_id)
@@ -1390,7 +1319,7 @@ async def run_broadcast(client, uid, account_ids=None):
                 stagger_idx = 0
                 for acc in accounts:
                     acc_id = acc['_id']
-                    if acc_id in banned_accounts or acc_id not in clients:
+                    if acc_id in banned_accounts or acc_id in spambot_restricted_accounts or acc_id not in clients:
                         continue
                     tg_client, session_str, phone = clients[acc_id]
                     stagger = stagger_idx * random.uniform(2, 4)
