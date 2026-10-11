@@ -693,6 +693,10 @@ async def send_ad_doc(tg_client, gid, ad_doc):
     varied_caption = vary_message(caption or "") if caption else ""
     tl_entities = pyrogram_entities_to_telethon(entities_data) if entities_data else None
 
+    media_exists = True
+    if media and isinstance(media, str) and not media.startswith(("http://", "https://")):
+        media_exists = os.path.exists(media)
+
     if ad_type == "forward" and from_chat and msg_id:
         await tg_client.forward_messages(
             entity=gid,
@@ -700,7 +704,7 @@ async def send_ad_doc(tg_client, gid, ad_doc):
             from_peer=from_chat,
             drop_author=True,
         )
-    elif media and ad_type in ("photo", "both"):
+    elif media and media_exists and ad_type in ("photo", "both"):
         await tg_client.send_file(
             gid, file=media, caption=varied_caption,
             formatting_entities=tl_entities
@@ -710,7 +714,7 @@ async def send_ad_doc(tg_client, gid, ad_doc):
             gid, varied_caption,
             formatting_entities=tl_entities
         )
-    elif media:
+    elif media and media_exists:
         await tg_client.send_file(
             gid, file=media, caption=varied_caption,
             formatting_entities=tl_entities
