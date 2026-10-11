@@ -480,11 +480,30 @@ async def load_session_from_string(session_str):
 INVISIBLE_CHARS = ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"]
 
 
+def parse_spintax(text: str) -> str:
+    """
+    Parse spintax patterns like {Hello|Hi|Hey} or nested {A|{B|C}} randomly.
+    Returns randomly selected variation.
+    """
+    if not text:
+        return ""
+    pattern = re.compile(r'\{([^{}]+)\}')
+    while True:
+        match = pattern.search(text)
+        if not match:
+            break
+        options = match.group(1).split('|')
+        chosen = random.choice(options)
+        text = text[:match.start()] + chosen + text[match.end():]
+    return text
+
+
 def vary_message(msg: str) -> str:
-    """Append a random invisible character so each send has a unique fingerprint."""
+    """Expand spin-tax variants and append an invisible character for zero-duplicate fingerprint."""
     if not msg:
         return ""
-    return msg + random.choice(INVISIBLE_CHARS)
+    expanded = parse_spintax(msg)
+    return expanded + random.choice(INVISIBLE_CHARS)
 
 
 async def safe_reconnect(tg_client, session_str, phone):
@@ -700,6 +719,8 @@ spambot_appeals_last_time = {}
 
 # In-memory storage for SpamBot restricted accounts: {acc_id: {"phone": phone, "expiry_ts": expiry_ts, "user_id": uid}}
 spambot_restricted_accounts = {}
+# In-memory storage for resting / cooldown accounts: {acc_id: expiry_ts}
+account_cooldowns = {}
 
 async def check_spambot_status(tg_client):
     """
@@ -1158,7 +1179,11 @@ async def run_broadcast(client, uid, account_ids=None):
                             assigned_aid = active_acc_keys[idx % num_active_accs]
                         assigned_groups[assigned_aid].append((gid, gname))
 
+                for aid in assigned_groups:
+                    random.shuffle(assigned_groups[aid])
+
                 cycle_posted_gids = set()
+                flood_waited_accounts = set()
 
                 # ── Worker function for simultaneous account broadcasting ──────
                 async def broadcast_worker(acc_id, tg_client, session_str, phone, start_stagger, acc_index):
@@ -1173,20 +1198,22 @@ async def run_broadcast(client, uid, account_ids=None):
                                 await asyncio.sleep(chunk)
                                 elapsed_stagger += chunk
 
-                        acc_groups = list(assigned_groups.get(acc_id, []))
-                        random.shuffle(acc_groups)
-
-                        for group_idx, (gid, group_name) in enumerate(acc_groups):
+                        group_idx = 0
+                        while True:
                             if not db.get_broadcast_state(uid).get("running", False):
                                 return
 
                             async with group_lock:
+                                if not assigned_groups.get(acc_id):
+                                    break
+                                gid, group_name = assigned_groups[acc_id].pop(0)
                                 if gid in cycle_posted_gids:
-                                    continue  # Already sent by another account in this cycle!
+                                    continue
 
                             # Base ad index: rotate across accounts and groups
                             chosen_ad_idx = (acc_index + cycle_count + group_idx) % num_ads
                             chosen_ad_doc = user_ads[chosen_ad_idx]
+                            group_idx += 1
 
                             # Auto-reconnect if client dropped
                             if not tg_client.is_connected():
@@ -1209,16 +1236,43 @@ async def run_broadcast(client, uid, account_ids=None):
                                 await send_dm_log(uid, f"<b>✅ Sent Ad #{ad_num_display} to {group_name}</b> via {phone}")
 
                             except FloodWaitError as e:
-                                wait = min(e.seconds, 120)
-                                logger.warning(f"FloodWait {e.seconds}s for {phone} in {gid}")
-                                await send_dm_log(uid, f"<b>⚠️ Flood wait {e.seconds}s — {group_name}</b> via {phone}")
+                                wait = e.seconds
                                 async with stats_lock:
                                     failed_count += 1
                                     db.increment_broadcast_stats(uid, False)
-                                for _ in range(int(wait)):
-                                    if not db.get_broadcast_state(uid).get("running", False):
-                                        return
-                                    await asyncio.sleep(1)
+
+                                if wait > 120:
+                                    flood_waited_accounts.add(acc_id)
+                                    account_cooldowns[acc_id] = time.time() + wait
+                                    available_other = [
+                                        aid for aid in active_acc_keys
+                                        if aid != acc_id and aid not in banned_accounts and aid not in flood_waited_accounts
+                                    ]
+                                    async with group_lock:
+                                        remaining = list(assigned_groups.get(acc_id, []))
+                                        if gid not in cycle_posted_gids:
+                                            remaining.insert(0, (gid, group_name))
+                                        assigned_groups[acc_id] = []
+                                        if remaining and available_other:
+                                            for r_i, r_g in enumerate(remaining):
+                                                tgt = available_other[r_i % len(available_other)]
+                                                assigned_groups[tgt].append(r_g)
+
+                                    logger.warning(f"FloodWait {wait}s for {phone}. Auto-swapped {len(remaining)} groups to {len(available_other)} other accounts.")
+                                    await send_dm_log(
+                                        uid,
+                                        f"<b>🔄 FloodWait Auto-Swapped:</b> Account <code>{phone}</code> hit {wait}s wait in <i>{group_name}</i>.\n"
+                                        f"<i>Reassigned {len(remaining)} group(s) to other active accounts to keep broadcasting without delay!</i>"
+                                    )
+                                    return
+                                else:
+                                    account_cooldowns[acc_id] = time.time() + wait
+                                    logger.warning(f"FloodWait {wait}s for {phone} in {gid}")
+                                    await send_dm_log(uid, f"<b>⚠️ Flood wait {wait}s — {group_name}</b> via {phone}")
+                                    for _ in range(int(wait)):
+                                        if not db.get_broadcast_state(uid).get("running", False):
+                                            return
+                                        await asyncio.sleep(1)
 
                             except Exception as e:
                                 err_str = str(e)
@@ -2033,7 +2087,12 @@ async def view_accounts(client, cb):
             InlineKeyboardButton("✏️ Change Bio (All)", callback_data="edit_bio_all"),
             InlineKeyboardButton("📁 Join Folder (All)", callback_data="join_folder_all")
         ])
-        buttons.append([InlineKeyboardButton("🚪 Auto-Leave Muted/Banned Groups", callback_data="leave_muted_groups_all")])
+        buttons.append([
+            InlineKeyboardButton("🔄 Sync Groups Across Accounts", callback_data="sync_groups_all"),
+            InlineKeyboardButton("🚪 Auto-Leave Muted Groups", callback_data="leave_muted_groups_all")
+        ])
+        if is_owner(uid):
+            buttons.append([InlineKeyboardButton("📦 Backup All Accounts (Sessions)", callback_data="backup_accounts")])
         buttons.append([InlineKeyboardButton("Back 🔙", callback_data="menu_main")])
         
         try:
@@ -2811,6 +2870,199 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
     await send_dm_log(uid, f"<b>📁 Folder join:</b> {len(success_list)}/{len(targets)} accounts joined.")
 
 
+@pyro.on_callback_query(filters.regex(r"^backup_accounts$"))
+async def backup_accounts_cb(client, cb):
+    uid = cb.from_user.id
+    if not is_owner(uid):
+        await cb.answer("Admin only feature!", show_alert=True)
+        return
+
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("No accounts hosted to backup!", show_alert=True)
+        return
+
+    await cb.answer("📦 Preparing encrypted account backup...", show_alert=False)
+    backup_data = {
+        "backup_created_at": datetime.now(timezone.utc).isoformat(),
+        "exported_by_user_id": uid,
+        "total_accounts": len(accounts),
+        "accounts": []
+    }
+
+    for acc in accounts:
+        decrypted_session = ""
+        try:
+            decrypted_session = cipher_suite.decrypt(acc['session_string'].encode()).decode()
+        except Exception:
+            decrypted_session = "DECRYPT_ERROR"
+
+        backup_data["accounts"].append({
+            "account_id": str(acc.get("_id", "")),
+            "name": get_account_display_name(acc),
+            "phone_number": acc.get("phone_number", ""),
+            "first_name": acc.get("first_name", ""),
+            "last_name": acc.get("last_name", ""),
+            "is_active": acc.get("is_active", True),
+            "session_string": decrypted_session,
+            "created_at": str(acc.get("created_at", ""))
+        })
+
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_filename = f"adbot_accounts_backup_{timestamp_str}.json"
+    temp_filepath = os.path.join(os.getcwd(), backup_filename)
+
+    try:
+        with open(temp_filepath, "w", encoding="utf-8") as f:
+            json.dump(backup_data, f, indent=2, ensure_ascii=False)
+
+        await client.send_document(
+            chat_id=uid,
+            document=temp_filepath,
+            caption=(
+                f"<b>📦 AD-BOT ACCOUNT SESSIONS BACKUP</b>\n\n"
+                f"• <b>Total Accounts:</b> {len(accounts)}\n"
+                f"• <b>Export Date:</b> <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</code>\n\n"
+                f"<i>⚠️ Keep this file strictly confidential! It contains working login sessions for all your hosted accounts.</i>"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+        await cb.answer("✅ Backup file sent directly to your DM!", show_alert=True)
+        await send_dm_log(uid, f"<b>📦 Account Backup Generated:</b> Exported {len(accounts)} accounts safely.")
+    except Exception as e:
+        logger.error(f"Backup export error: {e}")
+        await cb.answer(f"Backup failed: {str(e)[:50]}", show_alert=True)
+    finally:
+        if os.path.exists(temp_filepath):
+            try:
+                os.remove(temp_filepath)
+            except Exception:
+                pass
+
+
+@pyro.on_callback_query(filters.regex(r"^sync_groups_all$"))
+async def sync_groups_all_cb(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("No accounts hosted!", show_alert=True)
+        return
+
+    active_accounts = [a for a in accounts if a.get("is_active", True)]
+    if len(active_accounts) < 2:
+        await cb.answer("You need at least 2 active accounts to sync groups between them!", show_alert=True)
+        return
+
+    await cb.answer("⏳ Starting cross-account group synchronization...", show_alert=False)
+
+    status_msg = await cb.message.reply(
+        "⏳ <b>Cross-Account Group Sync Started...</b>\n\n"
+        f"Scanning groups across <b>{len(active_accounts)}</b> hosted accounts.\n"
+        "<i>Compiling master group list and syncing missing groups. Please wait...</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+    # Step 1: Connect accounts and scan their groups
+    account_groups = {}
+    connected_clients = {}
+
+    for acc in active_accounts:
+        acc_id = str(acc["_id"])
+        ph = acc.get("phone_number", "Unknown")
+        name = get_account_display_name(acc)
+        try:
+            session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
+            tg_c = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
+            await tg_c.connect()
+            if await tg_c.is_user_authorized():
+                connected_clients[acc_id] = (tg_c, ph, name)
+                acc_grps = []
+                async for dlg in tg_c.iter_dialogs(limit=100):
+                    if dlg.is_group:
+                        acc_grps.append((dlg.id, dlg.name, getattr(dlg.entity, 'username', None)))
+                account_groups[acc_id] = acc_grps
+            else:
+                await tg_c.disconnect()
+        except Exception as e:
+            logger.warning(f"Sync: could not connect {ph}: {e}")
+
+    if not connected_clients:
+        await status_msg.edit_text("❌ Failed to connect any accounts for synchronization.")
+        return
+
+    # If permanent folder is configured, also join folder on any accounts that missed it
+    perm_folder = getattr(config, 'PERMANENT_GROUP_FOLDER', '')
+    if perm_folder:
+        try:
+            folder_slug = perm_folder.strip().split('/')[-1].replace('+', '').replace('addlist?slug=', '')
+            for acc_id, (tg_c, ph, name) in connected_clients.items():
+                try:
+                    invite = await tg_c(chatlists.CheckChatlistInviteRequest(slug=folder_slug))
+                    if isinstance(invite, chatlist_types.ChatlistInvite) and hasattr(invite, 'missing_peers') and invite.missing_peers:
+                        await tg_c(chatlists.JoinChatlistInviteRequest(slug=folder_slug, peers=invite.missing_peers))
+                        logger.info(f"Sync: Account {ph} joined {len(invite.missing_peers)} missing peers from saved folder")
+                except Exception as fe:
+                    logger.debug(f"Sync folder check for {ph}: {fe}")
+                await asyncio.sleep(1.0)
+        except Exception as fe_all:
+            logger.warning(f"Sync folder joining error: {fe_all}")
+
+    # Build master list of unique groups with usernames or public links
+    master_public_groups = {}
+    for acc_id, grps in account_groups.items():
+        for gid, gname, uname in grps:
+            if uname:
+                master_public_groups[uname.lower()] = (uname, gname)
+
+    total_joined = 0
+    synced_details = []
+
+    # Step 2: For each account, join any missing public groups from the master list (safely capped)
+    for acc_id, (tg_c, ph, name) in connected_clients.items():
+        joined_this_acc = 0
+        current_unames = {g[2].lower() for g in account_groups.get(acc_id, []) if g[2]}
+        missing_unames = [u_data for u_lower, u_data in master_public_groups.items() if u_lower not in current_unames]
+
+        for u_orig, gname in missing_unames[:10]:
+            try:
+                await tg_c(functions.channels.JoinChannelRequest(channel=u_orig))
+                joined_this_acc += 1
+                total_joined += 1
+                await asyncio.sleep(random.uniform(3.5, 6.0))
+            except Exception as join_err:
+                logger.debug(f"Sync: {ph} join {u_orig} skipped: {join_err}")
+
+        if joined_this_acc > 0:
+            synced_details.append(f"• <b>{name}</b> (<code>{ph}</code>): Joined +{joined_this_acc} missing group(s)")
+
+    # Disconnect clients
+    for acc_id, (tg_c, _, _) in connected_clients.items():
+        try:
+            await tg_c.disconnect()
+        except Exception:
+            pass
+
+    summary_text = (
+        "<blockquote><b>╰_╯ GROUP SYNC COMPLETE! 🔄</b></blockquote>\n\n"
+        f"• <b>Accounts Synced:</b> {len(connected_clients)}\n"
+        f"• <b>Unique Groups Tracked:</b> {len(master_public_groups)}\n"
+        f"• <b>Missing Groups Joined:</b> {total_joined}\n\n"
+    )
+    if synced_details:
+        summary_text += "<b>Details:</b>\n" + "\n".join(synced_details) + "\n\n"
+    else:
+        summary_text += "<i>All accounts were already in sync and sharing all available groups!</i>\n\n"
+
+    summary_text += "<i>All synced groups are ready for broadcasting! 🚀</i>"
+
+    await status_msg.edit_text(
+        summary_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb([[InlineKeyboardButton("Back to Accounts 🔙", callback_data="view_accounts")]])
+    )
+    await send_dm_log(uid, f"<b>🔄 Groups Synced:</b> Joined {total_joined} missing groups across {len(connected_clients)} accounts.")
+
+
 @pyro.on_callback_query(filters.regex(r"^leave_muted_groups_all$"))
 async def leave_muted_groups_all_cb(client, cb):
     """Scan all hosted accounts and automatically leave any group where the account is muted, banned, or cannot write."""
@@ -3545,42 +3797,82 @@ async def stop_broadcast(client, cb):
     await send_dm_log(uid, f"<b>╰_╯ Broadcast stopped!</b>")
     logger.info(f"Broadcast stopped via callback for user {uid}")
 
-@pyro.on_callback_query(filters.regex("analytics"))
+@pyro.on_callback_query(filters.regex("^analytics$"))
 async def analytics(client, cb):
     uid = cb.from_user.id
     user_stats = db.get_user_analytics(uid)
     accounts = db.get_user_accounts(uid)
     logger_failures = len(db.get_logger_failures(uid))
-    
+
+    active_healthy = 0
+    spambot_count = 0
+    resting_count = 0
+    inactive_count = 0
+
+    now = time.time()
+    for acc in accounts:
+        acc_id = str(acc["_id"])
+        if not acc.get("is_active", True):
+            inactive_count += 1
+        elif acc_id in spambot_restricted_accounts:
+            spambot_count += 1
+        elif acc_id in account_cooldowns and account_cooldowns[acc_id] > now:
+            resting_count += 1
+        else:
+            active_healthy += 1
+
     analytics_text = (
-        f"<blockquote><b>╰_╯ ANALYTICS</b></blockquote>\n\n"
+        f"<blockquote><b>📊 ANALYTICS & HEALTH</b></blockquote>\n\n"
         f"<u>Broadcast Cycles Completed:</u> <code>{user_stats.get('total_cycles', 0)}</code>\n"
         f"<b>Messages Sent:</b> <i>{user_stats.get('total_sent', 0)}</i>\n"
         f"<u>Failed Sends:</u> <code>{user_stats.get('total_failed', 0)}</code>\n"
         f"<b>Logger Failures:</b> <i>{logger_failures}</i>\n"
-        f"<b>Active Accounts:</b> <i>{len([a for a in accounts if a['is_active']])}</i>\n"
         f"<u>Avg Delay:</u> <code>{db.get_user_ad_delay(uid)}s</code>\n\n"
+        f"<blockquote><b>🏥 Account Health Breakdown:</b>\n"
+        f"🟢 <b>Active & Healthy:</b> <code>{active_healthy}</code>\n"
+        f"⏳ <b>SpamBot Limited:</b> <code>{spambot_count}</code>\n"
+        f"💤 <b>Resting / Cooldown:</b> <code>{resting_count}</code>\n"
+        f"🔴 <b>Terminated / Logged Out:</b> <code>{inactive_count}</code></blockquote>\n\n"
         f"<blockquote>Success Rate: {generate_progress_bar(user_stats.get('total_sent', 0), user_stats.get('total_sent', 0) + user_stats.get('total_failed', 0))}</blockquote>"
     )
-    
+
     await cb.message.edit_caption(
         caption=analytics_text,
         reply_markup=kb([
+            [InlineKeyboardButton("🩺 Live Health Check", callback_data="account_health_check")],
             [InlineKeyboardButton("Detailed Report", callback_data="detailed_report")],
             [InlineKeyboardButton("Back", callback_data="menu_main")]
         ]),
         parse_mode=ParseMode.HTML
     )
 
-@pyro.on_callback_query(filters.regex("detailed_report"))
+
+@pyro.on_callback_query(filters.regex("^detailed_report$"))
 async def detailed_report(client, cb):
     uid = cb.from_user.id
     user_stats = db.get_user_analytics(uid)
     accounts = db.get_user_accounts(uid)
     logger_failures = db.get_logger_failures(uid)
-    
+
+    active_healthy = 0
+    spambot_count = 0
+    resting_count = 0
+    inactive_count = 0
+
+    now = time.time()
+    for acc in accounts:
+        acc_id = str(acc["_id"])
+        if not acc.get("is_active", True):
+            inactive_count += 1
+        elif acc_id in spambot_restricted_accounts:
+            spambot_count += 1
+        elif acc_id in account_cooldowns and account_cooldowns[acc_id] > now:
+            resting_count += 1
+        else:
+            active_healthy += 1
+
     detailed_text = (
-        f"<blockquote><b>╰_╯ DETAILED ANALYTICS REPORT:</b></blockquote>\n\n"
+        f"<blockquote><b>📊 DETAILED ANALYTICS REPORT:</b></blockquote>\n\n"
         f"<u>Date:</u> <i>{datetime.now().strftime('%d/%m/%y')}</i>\n"
         f"<b>User ID:</b> <code>{uid}</code>\n\n"
         "<b>Broadcast Stats:</b>\n"
@@ -3590,13 +3882,15 @@ async def detailed_report(client, cb):
         "<b>Logger Stats:</b>\n"
         f"- <u>Logger Failures:</u> <code>{len(logger_failures)}</code>\n"
         f"- <i>Last Failure:</i> <b>{logger_failures[-1]['error'] if logger_failures else 'None'}</b>\n\n"
-        "<b>Account Stats:</b>\n"
+        "<b>Account Health Breakdown:</b>\n"
         f"- <i>Total Accounts:</i> <u>{len(accounts)}</u>\n"
-        f"- <b>Active Accounts:</b> <code>{len([a for a in accounts if a['is_active']])}</code> 🟢\n"
-        f"- <u>Inactive Accounts:</u> <i>{len([a for a in accounts if not a['is_active']])}</i> 🔴\n\n"
+        f"- 🟢 <b>Active & Healthy:</b> <code>{active_healthy}</code>\n"
+        f"- ⏳ <b>SpamBot Limited:</b> <code>{spambot_count}</code>\n"
+        f"- 💤 <b>Resting / Cooldown:</b> <code>{resting_count}</code>\n"
+        f"- 🔴 <b>Terminated / Logged Out:</b> <code>{inactive_count}</code>\n\n"
         f"<blockquote><b>Current Delay:</b> <code>{db.get_user_ad_delay(uid)}s</code></blockquote>"
     )
-    
+
     await cb.message.edit_caption(
         caption=detailed_text,
         reply_markup=kb([
@@ -3604,6 +3898,143 @@ async def detailed_report(client, cb):
         ]),
         parse_mode=ParseMode.HTML
     )
+
+
+@pyro.on_callback_query(filters.regex("^account_health_check$"))
+async def account_health_check_cb(client, cb):
+    """
+    Live Account Health Check:
+    Concurrently verifies Telethon session validity, device revocations,
+    SpamBot restrictions, and cooldown timers for every hosted account.
+    """
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("No accounts hosted!", show_alert=True)
+        return
+
+    await cb.answer("🩺 Running live health check...", show_alert=False)
+
+    try:
+        await cb.message.edit_caption(
+            caption=(
+                "<blockquote><b>🩺 LIVE HEALTH CHECK IN PROGRESS...</b></blockquote>\n\n"
+                f"Scanning <b>{len(accounts)}</b> accounts...\n"
+                "<i>Checking Telegram sessions & @SpamBot limits.</i>\n\n"
+                "⏳ Please wait a moment..."
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.debug(f"Failed to edit caption for health check progress: {e}")
+
+    active_healthy_count = 0
+    spambot_count = 0
+    resting_count = 0
+    terminated_count = 0
+
+    sem = asyncio.Semaphore(5)
+
+    async def check_single_account(acc):
+        nonlocal active_healthy_count, spambot_count, resting_count, terminated_count
+        acc_id = str(acc["_id"])
+        phone = acc.get("phone_number", "Unknown")
+        name = get_account_display_name(acc)
+        is_active = acc.get("is_active", True)
+
+        now = time.time()
+        if acc_id in account_cooldowns and account_cooldowns[acc_id] > now:
+            rem_wait = int(account_cooldowns[acc_id] - now)
+            resting_count += 1
+            return f"• <b>{name}</b>: 💤 Resting ({rem_wait}s)"
+
+        if not is_active:
+            terminated_count += 1
+            return f"• <b>{name}</b>: 🔴 Inactive"
+
+        async with sem:
+            tg_c = None
+            try:
+                session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
+                tg_c = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
+                await asyncio.wait_for(tg_c.connect(), timeout=8.0)
+
+                if not await tg_c.is_user_authorized():
+                    terminated_count += 1
+                    db.deactivate_account(acc_id)
+                    return f"• <b>{name}</b>: 🔴 Logged Out"
+
+                is_restr, exp_ts, spambot_info = await check_spambot_status(tg_c)
+                if is_restr:
+                    spambot_count += 1
+                    spambot_restricted_accounts[acc_id] = {
+                        "phone": phone,
+                        "expiry_ts": exp_ts,
+                        "user_id": uid
+                    }
+                    return f"• <b>{name}</b>: ⏳ SpamBot Limited"
+                else:
+                    if acc_id in spambot_restricted_accounts:
+                        del spambot_restricted_accounts[acc_id]
+                    active_healthy_count += 1
+                    return f"• <b>{name}</b>: 🟢 Healthy & Ready"
+
+            except Exception as e:
+                err_msg = str(e)
+                if any(err in err_msg.lower() for err in ["deactivated", "session_revoked", "auth_key", "unregistered"]):
+                    terminated_count += 1
+                    db.deactivate_account(acc_id)
+                    return f"• <b>{name}</b>: 🔴 Session Revoked"
+                else:
+                    if acc.get("is_active", True):
+                        active_healthy_count += 1
+                        return f"• <b>{name}</b>: 🟢 Healthy"
+                    else:
+                        terminated_count += 1
+                        return f"• <b>{name}</b>: 🔴 Inactive"
+            finally:
+                if tg_c:
+                    try:
+                        await tg_c.disconnect()
+                    except Exception:
+                        pass
+
+    scan_tasks = [check_single_account(acc) for acc in accounts]
+    account_results = await asyncio.gather(*scan_tasks)
+
+    report_text = (
+        f"<blockquote><b>🩺 LIVE ACCOUNT HEALTH DASHBOARD</b></blockquote>\n\n"
+        f"<b>Health Summary ({len(accounts)} Accounts):</b>\n"
+        f"🟢 <b>Active & Healthy:</b> <code>{active_healthy_count}</code>\n"
+        f"⏳ <b>SpamBot Limited:</b> <code>{spambot_count}</code>\n"
+        f"💤 <b>Resting / Cooldown:</b> <code>{resting_count}</code>\n"
+        f"🔴 <b>Terminated / Logged Out:</b> <code>{terminated_count}</code>\n\n"
+        f"<b>Account Status Breakdown:</b>\n"
+    )
+
+    # Ensure final caption is strictly under 1000 characters to satisfy Telegram media limit
+    lines_to_add = []
+    current_len = len(report_text)
+    for res_line in account_results:
+        if current_len + len(res_line) + 40 > 980:
+            lines_to_add.append(f"<i>...and {len(account_results) - len(lines_to_add)} more accounts</i>")
+            break
+        lines_to_add.append(res_line)
+        current_len += len(res_line) + 1
+
+    report_text += "\n".join(lines_to_add)
+
+    try:
+        await cb.message.edit_caption(
+            caption=report_text,
+            reply_markup=kb([
+                [InlineKeyboardButton("🔄 Re-Scan Health", callback_data="account_health_check")],
+                [InlineKeyboardButton("Back to Analytics", callback_data="analytics")]
+            ]),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Failed to edit caption for health check report: {e}")
 
 @pyro.on_message(filters.command("stats") & filters.user(ALLOWED_BD_IDS))
 async def admin_stats(client, m):
