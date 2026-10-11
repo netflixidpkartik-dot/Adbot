@@ -1697,6 +1697,14 @@ async def run_broadcast(client, uid, account_ids=None):
                                         await asyncio.sleep(random.uniform(2.5, 4.0))
                                 elif is_r and not should_l:
                                     logger.info(f"Post-cycle: Account {p_num} kept in group {dlg.name} ({dlg.id}): {r_reason}")
+                                else:
+                                    # Ensure group is permanently muted so accounts stay quiet (mute_until=2038)
+                                    try:
+                                        p_inp = await tg_c.get_input_entity(dlg.entity)
+                                        mute_sett = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
+                                        await tg_c(UpdateNotifySettingsRequest(peer=InputNotifyPeer(p_inp), settings=mute_sett))
+                                    except Exception:
+                                        pass
 
                     except Exception as scan_err:
                         logger.error(f"Post-cycle maintenance error for {p_num}: {scan_err}")
@@ -2059,8 +2067,7 @@ async def menu_main(client, cb):
             f"•Broadcasting With: <code>{bcast_acc_label}</code>\n"
             f"•Ad Message: {ad_msg_status}\n"
             f"•Cycle Interval: {current_delay}s\n"
-            f"•Advertising Status: <b>{broadcast_status}</b>\n"
-            f"•Auto Reply: <b>{ar_status}</b>\n\n"
+            f"•Advertising Status: <b>{broadcast_status}</b>\n\n"
             "<blockquote>╰_╯Choose an action below to continue </blockquote>"
         )
 
@@ -2071,11 +2078,8 @@ async def menu_main(client, cb):
              InlineKeyboardButton("Set Time Interval", callback_data="set_delay")],
             [InlineKeyboardButton("Start Ads▶️", callback_data="start_broadcast"),
              InlineKeyboardButton("Stop Ads⏸️", callback_data="stop_broadcast")],
-            [InlineKeyboardButton(f"Auto Reply {ar_status}", callback_data="auto_reply_menu"),
-             InlineKeyboardButton("Analytics", callback_data="analytics")],
-            [InlineKeyboardButton("✏️ Change Bio", callback_data="change_bio_menu"),
-             InlineKeyboardButton("📁 Join Folder", callback_data="join_folder_menu")],
-            [InlineKeyboardButton("Delete Accounts", callback_data="delete_accounts")]
+            [InlineKeyboardButton("Analytics 📊", callback_data="analytics"),
+             InlineKeyboardButton("Delete Accounts 🗑️", callback_data="delete_accounts")]
         ]
         
         try:
@@ -2282,14 +2286,6 @@ async def view_accounts(client, cb):
         
         caption += "\n<blockquote>╰_╯Choose an action:</blockquote>"
         buttons.append([InlineKeyboardButton("Add Account ➕", callback_data="host_account")])
-        buttons.append([
-            InlineKeyboardButton("✏️ Change Bio (All)", callback_data="edit_bio_all"),
-            InlineKeyboardButton("📁 Join Folder (All)", callback_data="join_folder_all")
-        ])
-        buttons.append([
-            InlineKeyboardButton("🔄 Sync Groups Across Accounts", callback_data="sync_groups_all"),
-            InlineKeyboardButton("🚪 Auto-Leave Muted & Channels", callback_data="leave_muted_groups_all")
-        ])
         if is_owner(uid):
             buttons.append([InlineKeyboardButton("📦 Backup All Accounts (Sessions)", callback_data="backup_accounts")])
         buttons.append([InlineKeyboardButton("Back 🔙", callback_data="menu_main")])
@@ -2401,8 +2397,7 @@ async def view_account(client, cb):
     await cb.message.edit_caption(
         caption=caption,
         reply_markup=kb([
-            [InlineKeyboardButton("✏️ Change Bio", callback_data=f"edit_bio_acc_{acc_id}"),
-             InlineKeyboardButton("📁 Join Folder", callback_data=f"join_folder_acc_{acc_id}")],
+            [InlineKeyboardButton("✏️ Change Bio", callback_data=f"edit_bio_acc_{acc_id}")],
             [InlineKeyboardButton("Delete Account 🗑️", callback_data=f"delete_acc_{acc_id}")],
             [InlineKeyboardButton("Back 🔙", callback_data="view_accounts")]
         ]),
