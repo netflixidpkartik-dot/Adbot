@@ -7,6 +7,7 @@ import pymongo
 from pymongo.errors import ConnectionFailure, OperationFailure
 import config
 from bson.objectid import ObjectId
+from bson.binary import Binary
 import time
 import json
 
@@ -27,6 +28,7 @@ class EnhancedDatabaseManager:
         self.db = None
         self._init_db()
         self._load_persistent_globals()
+        self.backfill_ad_photos()
 
     def _create_indexes(self):
         # Helper function to ensure index with specific options and retries
@@ -385,6 +387,74 @@ class EnhancedDatabaseManager:
             logger.error(f"Failed to record joined target for {account_id}: {e}")
             return False
 
+    def mark_target_link_dead(self, target_key, reason=None):
+        """Mark a target group link as globally dead (expired, non-existent username, etc.)."""
+        try:
+            self.db.dead_targets.update_one(
+                {"target_key": target_key},
+                {"$set": {"reason": str(reason), "updated_at": datetime.now()}},
+                upsert=True
+            )
+            logger.info(f"Target link marked globally dead: {target_key} ({reason})")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to mark target dead {target_key}: {e}")
+            return False
+
+    def get_dead_target_keys(self):
+        """Get set of all globally dead target keys."""
+        try:
+            docs = self.db.dead_targets.find({}, {"target_key": 1})
+            return {d["target_key"] for d in docs if "target_key" in d}
+        except Exception as e:
+            logger.error(f"Failed to get dead target keys: {e}")
+            return set()
+
+    def set_account_broadcast_status(self, account_id, status="active", cooldown_until=0):
+        """Set account broadcast status ('active', 'skipped', 'resting')."""
+        try:
+            oid = ObjectId(account_id) if isinstance(account_id, str) else account_id
+            self.db.accounts.update_one(
+                {"_id": oid},
+                {"$set": {
+                    "broadcast_status": status,
+                    "broadcast_cooldown_until": float(cooldown_until),
+                    "status_updated_at": datetime.now()
+                }}
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set account broadcast status {account_id}: {e}")
+            return False
+
+    def get_account_broadcast_status(self, account_id):
+        """Get account broadcast status and cooldown."""
+        try:
+            oid = ObjectId(account_id) if isinstance(account_id, str) else account_id
+            doc = self.db.accounts.find_one({"_id": oid}, {"broadcast_status": 1, "broadcast_cooldown_until": 1})
+            if doc:
+                return doc.get("broadcast_status", "active"), doc.get("broadcast_cooldown_until", 0)
+            return "active", 0
+        except Exception as e:
+            logger.error(f"Failed to get account broadcast status {account_id}: {e}")
+            return "active", 0
+
+    def clear_all_account_broadcast_statuses(self, user_id):
+        """Reset all accounts to active status for a user."""
+        try:
+            self.db.accounts.update_many(
+                {"user_id": user_id},
+                {"$set": {
+                    "broadcast_status": "active",
+                    "broadcast_cooldown_until": 0.0,
+                    "status_updated_at": datetime.now()
+                }}
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear broadcast statuses for {user_id}: {e}")
+            return False
+
     def get_user_ad_messages(self, user_id):
         """Fetch all user's ad messages sorted by creation time."""
         try:
@@ -403,9 +473,16 @@ class EnhancedDatabaseManager:
             logger.error(f"Failed to get ad message {ad_id}: {e}")
             return None
 
-    def add_user_ad_message(self, user_id, message, created_at=None, photo_path=None, ad_type="text", entities=None, from_chat_id=None, message_id=None):
-        """Add an ad message for a user. Supports unlimited ad messages."""
+    def add_user_ad_message(self, user_id, message, created_at=None, photo_path=None, ad_type="text", entities=None, from_chat_id=None, message_id=None, photo_bytes=None):
+        """Add an ad message for a user. Supports unlimited ad messages and persistent binary media storage."""
         try:
+            if photo_bytes is None and photo_path and os.path.exists(photo_path):
+                try:
+                    with open(photo_path, "rb") as pf:
+                        photo_bytes = pf.read()
+                except Exception:
+                    photo_bytes = None
+
             doc = {
                 "user_id": user_id,
                 "message": message or "",
@@ -413,12 +490,13 @@ class EnhancedDatabaseManager:
                 "updated_at": datetime.now(),
                 "ad_type": ad_type,
                 "photo_path": photo_path,
+                "photo_data": Binary(photo_bytes) if photo_bytes else None,
                 "entities": entities or [],
                 "from_chat_id": int(from_chat_id) if from_chat_id is not None else None,
                 "message_id": int(message_id) if message_id is not None else None,
             }
             res = self.db.ad_messages.insert_one(doc)
-            logger.info(f"Ad message added for user {user_id} (id={res.inserted_id}, ad_type={ad_type})")
+            logger.info(f"Ad message added for user {user_id} (id={res.inserted_id}, ad_type={ad_type}, has_photo_data={bool(photo_bytes)})")
             return res.inserted_id
         except Exception as e:
             logger.error(f"Failed to add ad message for {user_id}: {e}")
@@ -443,6 +521,23 @@ class EnhancedDatabaseManager:
         except Exception as e:
             logger.error(f"Failed to clear ad messages for {user_id}: {e}")
             return 0
+
+    def backfill_ad_photos(self):
+        """Backfill existing photo ad messages with binary photo_data if local file exists."""
+        try:
+            ads = self.db.ad_messages.find({"photo_data": None, "photo_path": {"$ne": None}})
+            for ad in ads:
+                p = ad.get("photo_path")
+                if p and os.path.exists(p):
+                    try:
+                        with open(p, "rb") as pf:
+                            b = pf.read()
+                        self.db.ad_messages.update_one({"_id": ad["_id"]}, {"$set": {"photo_data": Binary(b)}})
+                        logger.info(f"Backfilled persistent photo_data for ad {ad['_id']}")
+                    except Exception as fe:
+                        logger.debug(f"Could not read {p}: {fe}")
+        except Exception as e:
+            logger.debug(f"Backfill photo notice: {e}")
 
     def get_user_ad_mode(self, user_id):
         """Get ad mode ('single' or 'rotation')."""

@@ -686,6 +686,19 @@ async def send_ad_doc(tg_client, gid, ad_doc):
     ad_type = ad_doc.get("ad_type", "text")
     caption = ad_doc.get("message", "")
     media = ad_doc.get("photo_path")
+    photo_data = ad_doc.get("photo_data")
+    if (not media or not os.path.exists(media)) and photo_data:
+        try:
+            os.makedirs("downloads", exist_ok=True)
+            ad_id_str = str(ad_doc.get("_id", "temp"))
+            restored_path = os.path.join("downloads", f"restored_ad_{ad_id_str}.jpg")
+            with open(restored_path, "wb") as f:
+                f.write(photo_data)
+            media = restored_path
+            logger.info(f"Restored ad photo from MongoDB to {restored_path}")
+        except Exception as rest_err:
+            logger.warning(f"Failed to restore photo_data for ad {ad_doc.get('_id')}: {rest_err}")
+
     entities_data = ad_doc.get("entities", [])
     from_chat = ad_doc.get("from_chat_id")
     msg_id = ad_doc.get("message_id")
@@ -891,6 +904,7 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
     """
     try:
         already_joined_keys = db.get_account_joined_targets(acc_id)
+        dead_target_keys = db.get_dead_target_keys()
         raw_links = getattr(config, 'DEFAULT_GROUP_LINKS', [])
         if not raw_links:
             return 0
@@ -904,15 +918,15 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
         pending_targets = []
         for s in folder_slugs:
             key = f"slug:{s}"
-            if key not in already_joined_keys:
+            if key not in already_joined_keys and key not in dead_target_keys:
                 pending_targets.append(("slug", s, key))
         for h in invite_hashes:
             key = f"hash:{h}"
-            if key not in already_joined_keys:
+            if key not in already_joined_keys and key not in dead_target_keys:
                 pending_targets.append(("hash", h, key))
         for u in usernames:
             key = f"user:{u.lower()}"
-            if key not in already_joined_keys:
+            if key not in already_joined_keys and key not in dead_target_keys:
                 pending_targets.append(("user", u, key))
 
         if not pending_targets:
@@ -965,6 +979,9 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
                             logger.info(f"Auto-Join: Account {phone} already in folder {target_val}")
                     except Exception as sl_err:
                         logger.warning(f"Auto-join folder slug error for {phone} ({target_val}): {sl_err}")
+                        err_str = str(sl_err).lower()
+                        if any(k in err_str for k in ("expired", "invalid", "not found", "chatlist_slug_invalid", "inviteslugempty")):
+                            db.mark_target_link_dead(target_key, sl_err)
                     db.record_account_joined_target(acc_id, target_key)
 
                 elif target_type == "hash":
@@ -987,6 +1004,11 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
                         err_str = str(h_err).lower()
                         if "already" in err_str:
                             logger.info(f"Auto-Join: Account {phone} already participant in +{target_val}")
+                        elif "requested to join" in err_str or "inviterequestsent" in err_str:
+                            logger.info(f"Auto-Join: Account {phone} requested to join (approval required) +{target_val}")
+                        elif any(k in err_str for k in ("expired", "invalid", "invite_hash_expired", "invite_hash_invalid")):
+                            db.mark_target_link_dead(target_key, h_err)
+                            logger.info(f"Auto-Join: Dead invite hash marked in DB: +{target_val} ({h_err})")
                         else:
                             raise h_err
                     db.record_account_joined_target(acc_id, target_key)
@@ -1010,6 +1032,11 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
                         err_str = str(u_err).lower()
                         if "already" in err_str:
                             logger.info(f"Auto-Join: Account {phone} already participant in @{target_val}")
+                        elif "requested to join" in err_str or "inviterequestsent" in err_str:
+                            logger.info(f"Auto-Join: Account {phone} requested to join (approval required) @{target_val}")
+                        elif any(k in err_str for k in ("no user has", "not found", "username_not_occupied", "usernamenotoccupied", "usernameinvalid", "username_invalid", "channel_private", "channelprivate")):
+                            db.mark_target_link_dead(target_key, u_err)
+                            logger.info(f"Auto-Join: Dead username marked in DB: @{target_val} ({u_err})")
                         else:
                             raise u_err
                     db.record_account_joined_target(acc_id, target_key)
@@ -1022,8 +1049,9 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
             except Exception as e:
                 err_str = str(e).lower()
                 logger.warning(f"Auto-Join error on {target_key} for {phone}: {e}")
-                if any(k in err_str for k in ("expired", "invalid", "not found", "username_not_occupied", "invite_hash_expired", "channel_private", "channels_too_much")):
-                    db.record_account_joined_target(acc_id, target_key)
+                if any(k in err_str for k in ("expired", "invalid", "not found", "username_not_occupied", "usernamenotoccupied", "invite_hash_expired", "invite_hash_invalid", "channel_private", "channelprivate", "no user has")):
+                    db.mark_target_link_dead(target_key, e)
+                db.record_account_joined_target(acc_id, target_key)
 
         await ensure_groups_folder(tg_client, newly_joined_peers)
         return joined_this_cycle
@@ -1070,6 +1098,17 @@ async def run_broadcast(client, uid, account_ids=None):
         clients = {}
         banned_accounts = set()
         skipped_accounts_cooldown = {}  # {acc_id: cooldown_timestamp}
+
+        # Restore persistent skipped account statuses from MongoDB
+        now_ts = time.time()
+        for acc in accounts:
+            b_st, b_cd = db.get_account_broadcast_status(acc['_id'])
+            if b_st == "skipped":
+                if b_cd > now_ts:
+                    banned_accounts.add(acc['_id'])
+                    skipped_accounts_cooldown[acc['_id']] = b_cd
+                else:
+                    db.set_account_broadcast_status(acc['_id'], status="active", cooldown_until=0)
         error_summary = []
 
         skip_group_ids = [config.MUSTJOIN_GROUP_ID]
@@ -1413,6 +1452,7 @@ async def run_broadcast(client, uid, account_ids=None):
                                                 logger.info(f"Reassigned {len(rem_grps)} remaining groups from {phone} to {len(other_avail)} other active accounts.")
                                         banned_accounts.add(acc_id)
                                         skipped_accounts_cooldown[acc_id] = time.time() + 3600
+                                        db.set_account_broadcast_status(acc_id, status="skipped", cooldown_until=time.time() + 3600)
                                         await send_dm_log(
                                             uid,
                                             f"<b>⏭️ Account Skipped:</b> <code>{phone}</code>\n"
@@ -1493,6 +1533,7 @@ async def run_broadcast(client, uid, account_ids=None):
                         if acc_cycle_attempts.get(acc_id, 0) > 0 and acc_cycle_sent.get(acc_id, 0) == 0:
                             banned_accounts.add(acc_id)
                             skipped_accounts_cooldown[acc_id] = time.time() + 3600
+                            db.set_account_broadcast_status(acc_id, status="skipped", cooldown_until=time.time() + 3600)
                             logger.warning(
                                 f"Account {phone} was persistent and not able to send across all {acc_cycle_attempts[acc_id]} assigned groups "
                                 f"(0 successful sends). Skipping this account from broadcasting."
@@ -1507,6 +1548,7 @@ async def run_broadcast(client, uid, account_ids=None):
                             logger.info(
                                 f"Account {phone} completed cycle successfully: posted to {acc_cycle_sent[acc_id]}/{acc_cycle_attempts.get(acc_id, 0)} groups. Keeping account active."
                             )
+                            db.set_account_broadcast_status(acc_id, status="active", cooldown_until=0)
                     except asyncio.CancelledError:
                         return
                     except Exception as ex:
@@ -1549,6 +1591,7 @@ async def run_broadcast(client, uid, account_ids=None):
                         logger.info(f"Cooldown passed for skipped account {s_phone}. Re-enabling for testing in next cycle.")
                         banned_accounts.discard(s_aid)
                         del skipped_accounts_cooldown[s_aid]
+                        db.set_account_broadcast_status(s_aid, status="active", cooldown_until=0)
                         maint_accounts_retested += 1
 
                 # 1. Check all accounts for session revocation (logged out from Telegram Devices)
@@ -3963,17 +4006,18 @@ async def analytics(client, cb):
     logger_failures = len(db.get_logger_failures(uid))
 
     active_healthy = 0
-    spambot_count = 0
+    skipped_count = 0
     resting_count = 0
     inactive_count = 0
 
     now = time.time()
     for acc in accounts:
         acc_id = str(acc["_id"])
+        b_st, b_cd = db.get_account_broadcast_status(acc_id)
         if not acc.get("is_active", True):
             inactive_count += 1
-        elif acc_id in spambot_restricted_accounts:
-            spambot_count += 1
+        elif b_st == "skipped" and b_cd > now:
+            skipped_count += 1
         elif acc_id in account_cooldowns and account_cooldowns[acc_id] > now:
             resting_count += 1
         else:
@@ -3988,7 +4032,7 @@ async def analytics(client, cb):
         f"<u>Avg Delay:</u> <code>{db.get_user_ad_delay(uid)}s</code>\n\n"
         f"<blockquote><b>🏥 Account Health Breakdown:</b>\n"
         f"🟢 <b>Active & Healthy:</b> <code>{active_healthy}</code>\n"
-        f"⏳ <b>SpamBot Limited:</b> <code>{spambot_count}</code>\n"
+        f"⏭️ <b>Temporarily Skipped:</b> <code>{skipped_count}</code>\n"
         f"💤 <b>Resting / Cooldown:</b> <code>{resting_count}</code>\n"
         f"🔴 <b>Terminated / Logged Out:</b> <code>{inactive_count}</code></blockquote>\n\n"
         f"<blockquote>Success Rate: {generate_progress_bar(user_stats.get('total_sent', 0), user_stats.get('total_sent', 0) + user_stats.get('total_failed', 0))}</blockquote>"
@@ -4013,17 +4057,18 @@ async def detailed_report(client, cb):
     logger_failures = db.get_logger_failures(uid)
 
     active_healthy = 0
-    spambot_count = 0
+    skipped_count = 0
     resting_count = 0
     inactive_count = 0
 
     now = time.time()
     for acc in accounts:
         acc_id = str(acc["_id"])
+        b_st, b_cd = db.get_account_broadcast_status(acc_id)
         if not acc.get("is_active", True):
             inactive_count += 1
-        elif acc_id in spambot_restricted_accounts:
-            spambot_count += 1
+        elif b_st == "skipped" and b_cd > now:
+            skipped_count += 1
         elif acc_id in account_cooldowns and account_cooldowns[acc_id] > now:
             resting_count += 1
         else:
@@ -4043,7 +4088,7 @@ async def detailed_report(client, cb):
         "<b>Account Health Breakdown:</b>\n"
         f"- <i>Total Accounts:</i> <u>{len(accounts)}</u>\n"
         f"- 🟢 <b>Active & Healthy:</b> <code>{active_healthy}</code>\n"
-        f"- ⏳ <b>SpamBot Limited:</b> <code>{spambot_count}</code>\n"
+        f"- ⏭️ <b>Temporarily Skipped:</b> <code>{skipped_count}</code>\n"
         f"- 💤 <b>Resting / Cooldown:</b> <code>{resting_count}</code>\n"
         f"- 🔴 <b>Terminated / Logged Out:</b> <code>{inactive_count}</code>\n\n"
         f"<blockquote><b>Current Delay:</b> <code>{db.get_user_ad_delay(uid)}s</code></blockquote>"
@@ -4063,7 +4108,7 @@ async def account_health_check_cb(client, cb):
     """
     Live Account Health Check:
     Concurrently verifies Telethon session validity, device revocations,
-    SpamBot restrictions, and cooldown timers for every hosted account.
+    skipped account cooldowns, and resting timers for every hosted account.
     """
     uid = cb.from_user.id
     accounts = db.get_user_accounts(uid)
@@ -4087,20 +4132,26 @@ async def account_health_check_cb(client, cb):
         logger.debug(f"Failed to edit caption for health check progress: {e}")
 
     active_healthy_count = 0
-    spambot_count = 0
+    skipped_count = 0
     resting_count = 0
     terminated_count = 0
 
     sem = asyncio.Semaphore(5)
 
     async def check_single_account(acc):
-        nonlocal active_healthy_count, spambot_count, resting_count, terminated_count
+        nonlocal active_healthy_count, skipped_count, resting_count, terminated_count
         acc_id = str(acc["_id"])
         phone = acc.get("phone_number", "Unknown")
         name = get_account_display_name(acc)
         is_active = acc.get("is_active", True)
 
         now = time.time()
+        b_st, b_cd = db.get_account_broadcast_status(acc_id)
+        if b_st == "skipped" and b_cd > now:
+            rem_m = max(1, int((b_cd - now) / 60))
+            skipped_count += 1
+            return f"• <b>{name}</b>: ⏭️ Skipped ({rem_m}m cooldown left)"
+
         if acc_id in account_cooldowns and account_cooldowns[acc_id] > now:
             rem_wait = int(account_cooldowns[acc_id] - now)
             resting_count += 1
@@ -4152,7 +4203,7 @@ async def account_health_check_cb(client, cb):
         f"<blockquote><b>🩺 LIVE ACCOUNT HEALTH DASHBOARD</b></blockquote>\n\n"
         f"<b>Health Summary ({len(accounts)} Accounts):</b>\n"
         f"🟢 <b>Active & Healthy:</b> <code>{active_healthy_count}</code>\n"
-        f"⏳ <b>SpamBot Limited:</b> <code>{spambot_count}</code>\n"
+        f"⏭️ <b>Temporarily Skipped:</b> <code>{skipped_count}</code>\n"
         f"💤 <b>Resting / Cooldown:</b> <code>{resting_count}</code>\n"
         f"🔴 <b>Terminated / Logged Out:</b> <code>{terminated_count}</code>\n\n"
         f"<b>Account Status Breakdown:</b>\n"
@@ -4181,6 +4232,64 @@ async def account_health_check_cb(client, cb):
         )
     except Exception as e:
         logger.error(f"Failed to edit caption for health check report: {e}")
+
+
+@pyro.on_message(filters.command("status") & filters.private)
+async def user_status_command(client, m):
+    """Live status command: displays current broadcasting state, account health, and skipped accounts."""
+    uid = m.from_user.id
+    accounts = db.get_user_accounts(uid)
+    bcast_state = db.get_broadcast_state(uid)
+    is_running = bcast_state.get("running", False)
+    user_stats = db.get_user_analytics(uid)
+
+    active_healthy = 0
+    skipped_count = 0
+    resting_count = 0
+    inactive_count = 0
+    now = time.time()
+    skipped_details = []
+
+    for acc in accounts:
+        acc_id = str(acc["_id"])
+        b_st, b_cd = db.get_account_broadcast_status(acc_id)
+        name = get_account_display_name(acc)
+        if not acc.get("is_active", True):
+            inactive_count += 1
+        elif b_st == "skipped" and b_cd > now:
+            skipped_count += 1
+            rem_m = max(1, int((b_cd - now) / 60))
+            skipped_details.append(f"• <b>{name}</b>: ⏭️ Skipped ({rem_m}m cooldown left)")
+        elif acc_id in account_cooldowns and account_cooldowns[acc_id] > now:
+            resting_count += 1
+        else:
+            active_healthy += 1
+
+    status_badge = "🟢 Running" if is_running else "⏸️ Stopped"
+    text = (
+        f"<blockquote><b>📡 LIVE ADBOT STATUS</b></blockquote>\n\n"
+        f"• <b>Broadcasting:</b> {status_badge}\n"
+        f"• <b>Total Accounts:</b> <code>{len(accounts)}</code>\n"
+        f"• <b>Total Sent:</b> <code>{user_stats.get('total_sent', 0)}</code>\n"
+        f"• <b>Cycle Interval:</b> <code>{db.get_user_ad_delay(uid)}s</code>\n\n"
+        f"<blockquote><b>🏥 Account Health Breakdown:</b>\n"
+        f"🟢 <b>Active & Healthy:</b> <code>{active_healthy}</code>\n"
+        f"⏭️ <b>Temporarily Skipped:</b> <code>{skipped_count}</code>\n"
+        f"💤 <b>Resting / Cooldown:</b> <code>{resting_count}</code>\n"
+        f"🔴 <b>Terminated / Logged Out:</b> <code>{inactive_count}</code></blockquote>"
+    )
+    if skipped_details:
+        text += "\n\n<b>Skipped Accounts:</b>\n" + "\n".join(skipped_details[:5])
+
+    await m.reply(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb([
+            [InlineKeyboardButton("🩺 Live Health Check", callback_data="account_health_check")],
+            [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+        ])
+    )
+
 
 @pyro.on_message(filters.command("stats") & filters.user(ALLOWED_BD_IDS))
 async def admin_stats(client, m):
@@ -4612,7 +4721,7 @@ async def handle_photo_message(client, m):
             )
             await send_dm_log(uid, f"<b>❌ Failed to set ad photo:</b> {str(e)}")
 
-@pyro.on_message(filters.text & filters.private & ~filters.command(["start", "bd", "me", "stats", "stop"]))
+@pyro.on_message(filters.text & filters.private & ~filters.command(["start", "bd", "me", "stats", "stop", "status"]))
 async def handle_text_message(client, m):
     uid = m.from_user.id
     state = db.get_user_state(uid)
