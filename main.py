@@ -560,6 +560,8 @@ async def send_dm_log(user_id, log_message):
         return
     try:
         await logger_client.resolve_peer(user_id)
+        if len(log_message) > 4000:
+            log_message = log_message[:3985] + "\n\n<i>[Truncated]</i>"
         await logger_client.send_message(user_id, log_message, parse_mode=ParseMode.HTML)
         logger.info(f"DM log sent to {user_id}: {log_message[:50]}...")
     except PeerIdInvalid:
@@ -1112,7 +1114,7 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
                 logger.warning(f"Auto-Join error on {target_key} for {phone}: {e}")
                 if any(k in err_str for k in ("expired", "invalid", "not found", "username_not_occupied", "usernamenotoccupied", "invite_hash_expired", "invite_hash_invalid", "channel_private", "channelprivate", "no user has")):
                     db.mark_target_link_dead(target_key, e)
-                db.record_account_joined_target(acc_id, target_key)
+                    db.record_account_joined_target(acc_id, target_key)
 
         await ensure_groups_folder(tg_client, newly_joined_peers)
         return joined_this_cycle
