@@ -894,6 +894,56 @@ async def ensure_groups_folder(tg_client, new_peers=None):
         logger.debug(f"Could not ensure 'groups' dialog filter: {e}")
 
 
+async def handle_group_join_verification(tg_client, entity_or_target, phone, context="auto_join"):
+    """
+    Handle automated verification for groups requiring a quick message after joining.
+    Specifically for @accounthubai (AI Account Hub) which requires a message within 30 seconds.
+    Sends a random word or letter (e.g. 1, a, b, c, hi, etc.) immediately within 2-5 seconds.
+    """
+    try:
+        target_name = ""
+        entity = None
+
+        if isinstance(entity_or_target, str):
+            clean_str = entity_or_target.strip().lower().replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "").lstrip("@")
+            target_name = clean_str
+            if target_name == "accounthubai":
+                try:
+                    entity = await tg_client.get_entity(entity_or_target)
+                except Exception as e:
+                    logger.warning(f"Could not resolve entity for verification @{entity_or_target} ({phone}): {e}")
+                    return False
+        else:
+            entity = entity_or_target
+            uname = getattr(entity, 'username', None)
+            if uname:
+                target_name = uname.lower()
+            else:
+                title = getattr(entity, 'title', '')
+                if "accounthubai" in str(title).lower():
+                    target_name = "accounthubai"
+
+        if target_name != "accounthubai" or not entity:
+            return False
+
+        # Random delay between 2.5 and 5.0 seconds (well within 30 seconds)
+        wait_time = random.uniform(2.5, 5.0)
+        logger.info(f"Verification trigger for @accounthubai on account {phone} ({context}). Waiting {wait_time:.1f}s before sending response...")
+        await asyncio.sleep(wait_time)
+
+        # Random word/letter options as requested ("any letter like 1 a b c etc")
+        verify_choices = ["1", "a", "b", "c", "d", "hi", "ok", "hey", "hello", "yes", "x", "y"]
+        verify_word = random.choice(verify_choices)
+
+        await tg_client.send_message(entity, verify_word)
+        logger.info(f"SUCCESS: Account {phone} sent verification word '{verify_word}' to @accounthubai ({context})")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Failed verification send to @accounthubai for {phone} ({context}): {e}")
+        return False
+
+
 async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, max_joins=2):
     """
     Gradually join 2-3 target groups per account per cycle safely:
@@ -929,6 +979,11 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
             if key not in already_joined_keys and key not in dead_target_keys:
                 pending_targets.append(("user", u, key))
 
+        # Prioritize @accounthubai at top of pending targets so it's always joined first
+        accounthubai_target = ("user", "accounthubai", "user:accounthubai")
+        if "user:accounthubai" not in already_joined_keys and "user:accounthubai" not in dead_target_keys:
+            pending_targets = [accounthubai_target] + [t for t in pending_targets if t[2] != "user:accounthubai"]
+
         if not pending_targets:
             return 0
 
@@ -950,6 +1005,9 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
                                 try:
                                     inp_peers.append(await tg_client.get_input_entity(ch))
                                     db.add_target_group(uid, ch.id, getattr(ch, 'title', str(ch.id)))
+                                    ch_uname = (getattr(ch, 'username', '') or '').lower()
+                                    if ch_uname == 'accounthubai':
+                                        asyncio.create_task(handle_group_join_verification(tg_client, ch, phone, context="auto_join_slug_chat"))
                                 except Exception:
                                     pass
                             if not inp_peers:
@@ -1026,8 +1084,11 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
                             pass
                         joined_this_cycle += 1
                         logger.info(f"Auto-Join: Account {phone} joined @{target_val}")
+                        await handle_group_join_verification(tg_client, entity, phone, context="auto_join_user")
                     except UserAlreadyParticipantError:
                         logger.info(f"Auto-Join: Account {phone} already participant in @{target_val}")
+                        if target_val.lower() == "accounthubai":
+                            await handle_group_join_verification(tg_client, target_val, phone, context="auto_join_already_participant")
                     except Exception as u_err:
                         err_str = str(u_err).lower()
                         if "already" in err_str:
@@ -2883,6 +2944,9 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                             try:
                                 inp_peers.append(await tg_client.get_input_entity(ch))
                                 db.add_target_group(uid, ch.id, getattr(ch, 'title', str(ch.id)))
+                                ch_uname = (getattr(ch, 'username', '') or '').lower()
+                                if ch_uname == 'accounthubai':
+                                    asyncio.create_task(handle_group_join_verification(tg_client, ch, phone, context="perform_join_folder_chat"))
                             except Exception:
                                 pass
                         if not inp_peers:
@@ -2982,7 +3046,10 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                         db.record_account_joined_target(acc_id, target_key)
                     logger.info(f"Join hash error for {phone} (+{h}): {e}")
 
-            # 3. Process Usernames
+            # 3. Process Usernames (prioritize accounthubai)
+            if any(u.lower() == "accounthubai" for u in usernames):
+                usernames = ["accounthubai"] + [u for u in usernames if u.lower() != "accounthubai"]
+
             for u in usernames:
                 target_key = f"user:{u.lower()}"
                 try:
@@ -2998,10 +3065,13 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                         pass
                     account_joined_count += 1
                     db.record_account_joined_target(acc_id, target_key)
+                    await handle_group_join_verification(tg_client, entity, phone, context="perform_join_user")
                     await asyncio.sleep(1)
                 except UserAlreadyParticipantError:
                     account_joined_count += 1
                     db.record_account_joined_target(acc_id, target_key)
+                    if u.lower() == "accounthubai":
+                        await handle_group_join_verification(tg_client, u, phone, context="perform_join_already_participant")
                 except FloodWaitError as e:
                     logger.warning(f"FloodWait in @{u} for {phone}: {e.seconds}s")
                     break
@@ -3221,6 +3291,8 @@ async def sync_groups_all_cb(client, cb):
                 await tg_c(functions.channels.JoinChannelRequest(channel=u_orig))
                 joined_this_acc += 1
                 total_joined += 1
+                if u_orig.lower().lstrip('@') == "accounthubai":
+                    await handle_group_join_verification(tg_c, u_orig, ph, context="sync_groups")
                 await asyncio.sleep(random.uniform(3.5, 6.0))
             except Exception as join_err:
                 logger.debug(f"Sync: {ph} join {u_orig} skipped: {join_err}")

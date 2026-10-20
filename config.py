@@ -24,6 +24,7 @@ PERMANENT_GROUP_FOLDER = os.getenv("PERMANENT_GROUP_FOLDER", "https://t.me/addli
 
 # Master Auto-Join Group Links (Folders, Private Invite Links & Public Groups)
 DEFAULT_GROUP_LINKS = [
+    "https://t.me/accounthubai",
     "https://t.me/addlist/oA8W6ECFJV9kNjBl",
     "https://t.me/addlist/xmTsNdurof8wNDQ1",
     "https://t.me/All_country_kyc",
