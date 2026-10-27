@@ -2433,6 +2433,13 @@ async def delete_account(client, cb):
     acc_id = cb.data.replace("delete_acc_", "")
     try:
         db.delete_user_account(uid, acc_id)
+        # Immediately disconnect from 24/7 DM forwarder
+        info = global_account_clients.pop(str(acc_id), None)
+        if info and info.get("client"):
+            try:
+                await info["client"].disconnect()
+            except Exception:
+                pass
         await cb.message.edit_caption(
             caption="""<blockquote><b> Account deleted!</b></blockquote>\n\n"""
                     """Account removed successfully.✅""",
