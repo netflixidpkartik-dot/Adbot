@@ -267,8 +267,10 @@ logger_client = PyroClient("logger_bot", api_id=config.API_ID, api_hash=config.A
 # In-memory storage for broadcast tasks
 user_tasks = {}
 
-# In-memory storage for auto-reply Telethon clients: {owner_uid: {acc_id: tg_client}}
-autoreply_clients = {}
+# Global persistent Telethon clients for 24/7 DM forwarding across all hosted accounts:
+# {str(acc_id): {"client": tg_client, "phone": phone, "session_str": session_str, "user_id": uid}}
+global_account_clients = {}
+autoreply_clients = global_account_clients
 
 # Account-level bans (the entire Telegram account / session is blocked or revoked)
 ACCOUNT_BAN_ERRORS = (
@@ -1195,42 +1197,45 @@ async def run_broadcast(client, uid, account_ids=None):
 
         # ── Connect accounts with stagger delay ──────────────────────────────
         for i, acc in enumerate(accounts):
+            acc_id_str = str(acc['_id'])
             try:
-                session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
-                tg_client = TelegramClient(
-                    StringSession(session_str),
-                    config.API_ID,
-                    config.API_HASH,
-                    connection_retries=3,
-                    retry_delay=5,
-                    receive_updates=True,
-                )
-                await tg_client.connect()
+                # Reuse persistent 24/7 client if already connected
+                if acc_id_str in global_account_clients and global_account_clients[acc_id_str]["client"].is_connected():
+                    tg_client = global_account_clients[acc_id_str]["client"]
+                    session_str = global_account_clients[acc_id_str]["session_str"]
+                else:
+                    session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
+                    tg_client = TelegramClient(
+                        StringSession(session_str),
+                        config.API_ID,
+                        config.API_HASH,
+                        connection_retries=3,
+                        retry_delay=5,
+                        receive_updates=True,
+                    )
+                    await tg_client.connect()
 
-                # Check auth directly — if session was logged out/terminated in Telegram Devices, remove from bot & DB
-                if not await tg_client.is_user_authorized():
-                    await tg_client.disconnect()
-                    db.delete_user_account(uid, str(acc['_id']))
-                    logger.warning(f"Deleted terminated session for {acc['phone_number']} (ID: {acc['_id']})")
-                    await send_dm_log(uid, f"<b>🗑️ Session Terminated / Logged Out:</b> Account <code>{acc['phone_number']}</code> was logged out from Telegram Devices and has been automatically removed from the bot.")
-                    continue
+                    # Check auth directly — if session was logged out/terminated in Telegram Devices, remove from bot & DB
+                    if not await tg_client.is_user_authorized():
+                        await tg_client.disconnect()
+                        db.delete_user_account(uid, str(acc['_id']))
+                        global_account_clients.pop(acc_id_str, None)
+                        logger.warning(f"Deleted terminated session for {acc['phone_number']} (ID: {acc['_id']})")
+                        await send_dm_log(uid, f"<b>🗑️ Session Terminated / Logged Out:</b> Account <code>{acc['phone_number']}</code> was logged out from Telegram Devices and has been automatically removed from the bot.")
+                        continue
 
-                # Ensure account profile name is synced in MongoDB
-                if not acc.get('first_name'):
+                    # Setup incoming customer DM forwarder & auto-reply listener
                     try:
-                        me = await tg_client.get_me()
-                        if me:
-                            db.update_account_name(acc['_id'], me.first_name or '', me.last_name or '')
-                            acc['first_name'] = me.first_name or ''
-                            acc['last_name'] = me.last_name or ''
-                    except Exception:
-                        pass
+                        await setup_account_dm_forwarder_and_reply(uid, tg_client, acc['phone_number'])
+                    except Exception as dm_err:
+                        logger.warning(f"Could not setup DM forwarder for {acc['phone_number']}: {dm_err}")
 
-                # Setup incoming customer DM forwarder & auto-reply listener
-                try:
-                    await setup_account_dm_forwarder_and_reply(uid, tg_client, acc['phone_number'])
-                except Exception as dm_err:
-                    logger.warning(f"Could not setup DM forwarder for {acc['phone_number']}: {dm_err}")
+                    global_account_clients[acc_id_str] = {
+                        "client": tg_client,
+                        "phone": acc['phone_number'],
+                        "session_str": session_str,
+                        "user_id": uid
+                    }
 
                 # Auto-join the ad source channel if not already in it
                 if config.AD_SOURCE_CHANNEL:
@@ -1864,11 +1869,7 @@ async def run_broadcast(client, uid, account_ids=None):
             raise
 
         finally:
-            for acc_id, (tg_client, _, phone) in clients.items():
-                try:
-                    await tg_client.disconnect()
-                except Exception as e:
-                    logger.error(f"Disconnect error for {phone}: {e}")
+            logger.info(f"Broadcast loop stopped for user {uid}. Accounts remain actively connected for 24/7 DM forwarding.")
             db.set_broadcast_state(uid, running=False)
             if uid in user_tasks:
                 del user_tasks[uid]
@@ -5404,6 +5405,88 @@ async def setup_account_dm_forwarder_and_reply(uid, tg_client, phone):
 start_auto_reply_listeners = setup_account_dm_forwarder_and_reply
 
 
+async def persistent_dm_forwarder_service():
+    """
+    24/7 Persistent DM Forwarder Background Service:
+    Maintains all active hosted accounts connected in the background, listening
+    for customer DMs and forwarding them into the DM group or to @negi_support,
+    regardless of whether an advertising broadcast is active or stopped.
+    """
+    logger.info("Starting 24/7 Persistent DM Forwarder Background Service...")
+    await asyncio.sleep(4)
+
+    while True:
+        try:
+            active_accounts = list(db.db.accounts.find({"is_active": True}))
+            current_active_ids = {str(a["_id"]) for a in active_accounts}
+
+            # 1. Clean up removed or deactivated accounts
+            for aid in list(global_account_clients.keys()):
+                if str(aid) not in current_active_ids:
+                    info = global_account_clients.pop(aid, None)
+                    if info and info.get("client"):
+                        try:
+                            await info["client"].disconnect()
+                        except Exception:
+                            pass
+                    logger.info(f"24/7 DM Forwarder: Disconnected inactive account {aid}")
+
+            # 2. Connect missing or reconnect dropped accounts
+            for acc in active_accounts:
+                acc_id_str = str(acc["_id"])
+                uid = acc.get("user_id")
+                phone = acc.get("phone_number", "Unknown")
+
+                if acc_id_str in global_account_clients:
+                    client_info = global_account_clients[acc_id_str]
+                    tg_c = client_info.get("client")
+                    if tg_c and tg_c.is_connected():
+                        continue
+                    logger.warning(f"24/7 DM Forwarder: Reconnecting client for {phone}...")
+                    try:
+                        await tg_c.connect()
+                        if tg_c.is_connected():
+                            continue
+                    except Exception as rc_err:
+                        logger.debug(f"Reconnect failed for {phone}: {rc_err}")
+
+                try:
+                    sess_str = cipher_suite.decrypt(acc["session_string"].encode()).decode()
+                    tg_client = TelegramClient(
+                        StringSession(sess_str),
+                        config.API_ID,
+                        config.API_HASH,
+                        connection_retries=3,
+                        retry_delay=5,
+                        receive_updates=True
+                    )
+                    await tg_client.connect()
+                    if not await tg_client.is_user_authorized():
+                        logger.warning(f"24/7 DM Forwarder: Unauthorized session for {phone}")
+                        await tg_client.disconnect()
+                        continue
+
+                    # Attach DM forwarder and auto-reply listener
+                    await setup_account_dm_forwarder_and_reply(uid, tg_client, phone)
+
+                    global_account_clients[acc_id_str] = {
+                        "client": tg_client,
+                        "phone": phone,
+                        "session_str": sess_str,
+                        "user_id": uid
+                    }
+                    logger.info(f"24/7 DM Forwarder: Account {phone} connected & listening 24/7 (owner: {uid})")
+                    await asyncio.sleep(0.5)
+
+                except Exception as c_err:
+                    logger.debug(f"24/7 DM Forwarder: Connect error for {phone}: {c_err}")
+
+        except Exception as loop_err:
+            logger.error(f"Error in persistent_dm_forwarder_service: {loop_err}")
+
+        await asyncio.sleep(30)
+
+
 async def _handle_telethon_phone(uid, text, m):
     """Handle telethon_wait_phone state."""
     if not validate_phone_number(text):
@@ -5812,11 +5895,22 @@ async def main():
             logger.info(f"Logger bot connected: @{logger_me.username} (ID: {logger_me.id})")
     except Exception as e:
         logger.warning(f"Failed to fetch bot usernames dynamically: {e}")
+
+    # Launch 24/7 Persistent Background DM Forwarder Service
+    dm_forwarder_task = asyncio.create_task(persistent_dm_forwarder_service())
+
     try:
         await idle()
     except KeyboardInterrupt:
         for uid, task in list(user_tasks.items()):
             task.cancel()
+        if not dm_forwarder_task.done():
+            dm_forwarder_task.cancel()
+        for aid, info in list(global_account_clients.items()):
+            try:
+                await info["client"].disconnect()
+            except Exception:
+                pass
         db.close()
         logger.info("Bot stopped gracefully")
 
