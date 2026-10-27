@@ -646,12 +646,6 @@ async def validate_session(session_str):
         return False
 
 async def stop_broadcast_task(uid):
-    state = db.get_broadcast_state(uid)
-    running = state.get("running", False)
-    if not running:
-        logger.info(f"No broadcast running for user {uid}")
-        return False
-
     task = user_tasks.pop(uid, None)
     if task:
         try:
@@ -663,8 +657,10 @@ async def stop_broadcast_task(uid):
         except Exception as e:
             logger.error(f"Failed to cancel broadcast task for {uid}: {e}")
     
+    state = db.get_broadcast_state(uid)
+    was_running = state.get("running", False)
     db.set_broadcast_state(uid, running=False)
-    return True
+    return was_running or (task is not None)
 
 async def get_channel_ad_message(tg_client):
     """Fetch the latest message (text or media) from the owner's ad source channel."""
@@ -722,20 +718,42 @@ async def send_ad_doc(tg_client, gid, ad_doc):
             drop_author=True,
         )
     elif media and media_exists and ad_type in ("photo", "both"):
-        await tg_client.send_file(
-            gid, file=media, caption=varied_caption,
-            formatting_entities=tl_entities
-        )
+        try:
+            await tg_client.send_file(
+                gid, file=media, caption=varied_caption,
+                formatting_entities=tl_entities
+            )
+        except Exception as media_err:
+            m_err_str = str(media_err).lower()
+            if caption and any(k in m_err_str for k in ("sendmedia", "send_media", "chat_send_media_forbidden", "chatsendmediaforbidden", "photos_forbidden", "media_forbidden", "userbannedinchannel")):
+                logger.warning(f"Media send blocked in {gid} ({media_err}). Automatically falling back to text-only send...")
+                await tg_client.send_message(
+                    gid, varied_caption,
+                    formatting_entities=tl_entities
+                )
+            else:
+                raise media_err
     elif caption:
         await tg_client.send_message(
             gid, varied_caption,
             formatting_entities=tl_entities
         )
     elif media and media_exists:
-        await tg_client.send_file(
-            gid, file=media, caption=varied_caption,
-            formatting_entities=tl_entities
-        )
+        try:
+            await tg_client.send_file(
+                gid, file=media, caption=varied_caption,
+                formatting_entities=tl_entities
+            )
+        except Exception as media_err:
+            m_err_str = str(media_err).lower()
+            if caption and any(k in m_err_str for k in ("sendmedia", "send_media", "chat_send_media_forbidden", "chatsendmediaforbidden", "photos_forbidden", "media_forbidden", "userbannedinchannel")):
+                logger.warning(f"Media send blocked in {gid} ({media_err}). Automatically falling back to text-only send...")
+                await tg_client.send_message(
+                    gid, varied_caption,
+                    formatting_entities=tl_entities
+                )
+            else:
+                raise media_err
     else:
         await tg_client.send_message(
             gid, varied_caption,
@@ -3899,9 +3917,19 @@ async def start_broadcast(client, cb):
     """Show account-selection screen before starting broadcast."""
     uid = cb.from_user.id
     try:
-        if db.get_broadcast_state(uid).get("running"):
+        bcast_state = db.get_broadcast_state(uid)
+        is_running_in_db = bcast_state.get("running", False)
+        active_task = user_tasks.get(uid)
+        is_task_alive = active_task is not None and not active_task.done()
+
+        if is_running_in_db and is_task_alive:
             await cb.answer("╰_╯Broadcast already running!", show_alert=True)
             return
+        elif is_running_in_db and not is_task_alive:
+            # Ghost/zombie state: marked running in DB but no active async task exists
+            logger.info(f"Clearing stale broadcast state for user {uid} (task was not running).")
+            db.set_broadcast_state(uid, running=False)
+            user_tasks.pop(uid, None)
 
         accounts = db.get_user_accounts(uid)
         if not accounts:
@@ -5888,6 +5916,39 @@ async def handle_document_message(client, m):
         )
 
 
+async def auto_resume_active_broadcasts():
+    """On bot startup or server reboot, automatically resume any broadcasts that were running."""
+    # Give the bot 6 seconds to establish its connections and start DM forwarder
+    await asyncio.sleep(6)
+    try:
+        running_uids = db.get_all_running_broadcast_users()
+        if not running_uids:
+            logger.info("Auto-resume: No active broadcasts to resume on startup.")
+            return
+
+        logger.info(f"Auto-resuming active broadcast(s) for user(s): {running_uids}")
+        for uid in running_uids:
+            if uid in user_tasks and not user_tasks[uid].done():
+                continue
+
+            accounts = db.get_user_accounts(uid)
+            if not accounts:
+                logger.warning(f"Auto-resume: User {uid} has running=True but no accounts. Setting running=False.")
+                db.set_broadcast_state(uid, running=False)
+                continue
+
+            selected = db.get_selected_broadcast_accounts(uid)
+            logger.info(f"Auto-resuming broadcast for user {uid} (selected: {selected})...")
+            await _launch_broadcast(pyro, uid, account_ids=selected)
+            await send_dm_log(
+                uid,
+                "<b>🔄 Server Reboot Auto-Recovery:</b>\n"
+                "<i>Bot has safely resumed your ad broadcast in the background! ✅</i>"
+            )
+    except Exception as e:
+        logger.error(f"Error in auto_resume_active_broadcasts: {e}")
+
+
 async def main():
     await pyro.start()
     await logger_client.start()
@@ -5905,6 +5966,9 @@ async def main():
 
     # Launch 24/7 Persistent Background DM Forwarder Service
     dm_forwarder_task = asyncio.create_task(persistent_dm_forwarder_service())
+
+    # Auto-resume broadcasts that were running before server reboot
+    asyncio.create_task(auto_resume_active_broadcasts())
 
     try:
         await idle()

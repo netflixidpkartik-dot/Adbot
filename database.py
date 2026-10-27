@@ -624,6 +624,15 @@ class EnhancedDatabaseManager:
             logger.error(f"Failed to get broadcast state for {user_id}: {e}")
             return {"running": False, "paused": False}
 
+    def get_all_running_broadcast_users(self):
+        """Get list of user_ids that have running=True in broadcast_states."""
+        try:
+            docs = self.db.broadcast_states.find({"running": True}, {"user_id": 1})
+            return [doc["user_id"] for doc in docs if "user_id" in doc]
+        except Exception as e:
+            logger.error(f"Failed to get running broadcast users: {e}")
+            return []
+
     def set_broadcast_state(self, user_id, running=False, paused=False):
         """Set user's broadcast state."""
         try:
