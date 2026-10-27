@@ -1222,6 +1222,13 @@ async def run_broadcast(client, uid, account_ids=None):
                     tg_client = global_account_clients[acc_id_str]["client"]
                     session_str = global_account_clients[acc_id_str]["session_str"]
                 else:
+                    if acc_id_str in global_account_clients:
+                        old_info = global_account_clients.pop(acc_id_str, None)
+                        if old_info and old_info.get("client"):
+                            try:
+                                await old_info["client"].disconnect()
+                            except Exception:
+                                pass
                     session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
                     tg_client = TelegramClient(
                         StringSession(session_str),
@@ -5475,15 +5482,23 @@ async def persistent_dm_forwarder_service():
                 if acc_id_str in global_account_clients:
                     client_info = global_account_clients[acc_id_str]
                     tg_c = client_info.get("client")
-                    if tg_c and tg_c.is_connected():
-                        continue
-                    logger.warning(f"24/7 DM Forwarder: Reconnecting client for {phone}...")
-                    try:
-                        await tg_c.connect()
-                        if tg_c.is_connected():
-                            continue
-                    except Exception as rc_err:
-                        logger.debug(f"Reconnect failed for {phone}: {rc_err}")
+                    if tg_c:
+                        try:
+                            if tg_c.is_connected():
+                                continue
+                            logger.warning(f"24/7 DM Forwarder: Reconnecting client for {phone}...")
+                            await tg_c.connect()
+                            if tg_c.is_connected():
+                                continue
+                        except Exception as rc_err:
+                            logger.debug(f"Reconnect failed for {phone}: {rc_err}")
+                        
+                        # Clean up dropped client before creating a replacement
+                        try:
+                            await tg_c.disconnect()
+                        except Exception:
+                            pass
+                    global_account_clients.pop(acc_id_str, None)
 
                 try:
                     sess_str = cipher_suite.decrypt(acc["session_string"].encode()).decode()
@@ -5519,7 +5534,7 @@ async def persistent_dm_forwarder_service():
         except Exception as loop_err:
             logger.error(f"Error in persistent_dm_forwarder_service: {loop_err}")
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
 
 
 async def _handle_telethon_phone(uid, text, m):
@@ -5972,17 +5987,22 @@ async def main():
 
     try:
         await idle()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError, Exception) as exit_err:
+        logger.info(f"Main loop interrupted: {exit_err}")
+    finally:
         for uid, task in list(user_tasks.items()):
-            task.cancel()
+            try: task.cancel()
+            except Exception: pass
         if not dm_forwarder_task.done():
-            dm_forwarder_task.cancel()
+            try: dm_forwarder_task.cancel()
+            except Exception: pass
         for aid, info in list(global_account_clients.items()):
             try:
                 await info["client"].disconnect()
             except Exception:
                 pass
-        db.close()
+        try: db.close()
+        except Exception: pass
         logger.info("Bot stopped gracefully")
 
 if __name__ == "__main__":
