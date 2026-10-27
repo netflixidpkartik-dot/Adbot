@@ -5277,6 +5277,15 @@ async def setup_account_dm_forwarder_and_reply(uid, tg_client, phone):
                             break
                     except Exception:
                         pass
+            if target_cache["support"] is None:
+                try:
+                    async for dlg in tg_client.iter_dialogs(limit=50):
+                        if dlg.is_user:
+                            if dlg.id == support_id or (getattr(dlg.entity, 'username', '') or '').lower() == support_handle.lower():
+                                target_cache["support"] = dlg.entity
+                                break
+                except Exception:
+                    pass
 
         return target_cache["dm_group"], target_cache["support"]
 
@@ -5316,7 +5325,7 @@ async def setup_account_dm_forwarder_and_reply(uid, tg_client, phone):
 
         # ── Step A: Forward to Private Group or @negi_support ─────────────────
         dm_grp, support_usr = await _get_targets()
-        forwarded = False
+        forward_target_name = None
 
         header_text = (
             f"<blockquote><b>📩 NEW CUSTOMER DM RECEIVED</b></blockquote>\n\n"
@@ -5336,24 +5345,35 @@ async def setup_account_dm_forwarder_and_reply(uid, tg_client, phone):
                 except Exception as fwd_err:
                     raw_txt = event.raw_text or "[Non-text media or protected message]"
                     await tg_client.send_message(dm_grp, f"💬 <b>Message Content:</b>\n{raw_txt}", parse_mode='html')
-                forwarded = True
+                forward_target_name = "DM Group"
                 logger.info(f"Customer DM from {sender_id} forwarded to DM group for +{clean_phone}")
             except Exception as e:
-                logger.error(f"Failed to forward DM to target group: {e}")
+                logger.warning(f"Account +{clean_phone} could not post to DM group ({e}). Falling back directly to @{support_handle}...")
 
-        # Secondary / Fallback: If group forward failed, forward directly to @negi_support
-        if not forwarded and support_usr:
-            try:
-                await tg_client.send_message(support_usr, header_text, parse_mode='html')
+        # Secondary / Direct Fallback to @negi_support: If group forward failed or group restricted
+        if not forward_target_name:
+            if not support_usr:
+                for s_cand in [support_handle, support_id]:
+                    if s_cand:
+                        try:
+                            support_usr = await tg_client.get_entity(s_cand)
+                            if support_usr:
+                                target_cache["support"] = support_usr
+                                break
+                        except Exception:
+                            pass
+            if support_usr:
                 try:
-                    await tg_client.forward_messages(support_usr, event.message)
-                except Exception:
-                    raw_txt = event.raw_text or "[Non-text media or protected message]"
-                    await tg_client.send_message(support_usr, f"💬 <b>Message Content:</b>\n{raw_txt}", parse_mode='html')
-                forwarded = True
-                logger.info(f"Customer DM from {sender_id} forwarded to support @{support_handle} for +{clean_phone}")
-            except Exception as se:
-                logger.error(f"Failed to forward DM to support handle: {se}")
+                    await tg_client.send_message(support_usr, header_text, parse_mode='html')
+                    try:
+                        await tg_client.forward_messages(support_usr, event.message)
+                    except Exception:
+                        raw_txt = event.raw_text or "[Non-text media or protected message]"
+                        await tg_client.send_message(support_usr, f"💬 <b>Message Content:</b>\n{raw_txt}", parse_mode='html')
+                    forward_target_name = f"@{support_handle}"
+                    logger.info(f"Customer DM from {sender_id} forwarded directly to @{support_handle} for +{clean_phone}")
+                except Exception as se:
+                    logger.error(f"Failed to forward DM directly to @{support_handle} on +{clean_phone}: {se}")
 
         # ── Step B: Handle Auto-Reply If Enabled in Settings ──────────────────
         try:
@@ -5367,7 +5387,7 @@ async def setup_account_dm_forwarder_and_reply(uid, tg_client, phone):
 
         # ── Step C: Notify Bot Owner in DM Logs ───────────────────────────────
         try:
-            status_txt = "Forwarded to DM group ✅" if forwarded else "Logged ⚠️"
+            status_txt = f"Forwarded to {forward_target_name} ✅" if forward_target_name else "Logged ⚠️"
             await send_dm_log(
                 uid,
                 f"<b>📩 Customer DM Received on +{clean_phone}:</b>\n"
