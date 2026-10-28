@@ -1151,6 +1151,256 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
         return 0
 
 
+async def setup_account_dm_forwarder_and_reply(uid, tg_client, phone):
+    """
+    Ensure account is joined to the target DM group, and register a Telethon event handler
+    that automatically forwards any incoming private customer DMs into the private DM group
+    (https://t.me/+C42q9yVOumJkZjg9) or @negi_support, and triggers auto-reply if enabled.
+    """
+    dm_link = getattr(config, 'FORWARD_DM_GROUP_LINK', 'https://t.me/+C42q9yVOumJkZjg9')
+    dm_hash = getattr(config, 'FORWARD_DM_HASH', 'C42q9yVOumJkZjg9')
+    dm_group_id = getattr(config, 'FORWARD_DM_GROUP_ID', -5576258867)
+    support_handle = getattr(config, 'FORWARD_DM_SUPPORT_HANDLE', 'negi_support').lstrip('@')
+    support_id = getattr(config, 'FORWARD_DM_SUPPORT_ID', 8104033602)
+
+    # 1. Ensure account is a member of the DM logging group so it has permission to send & forward
+    try:
+        await tg_client(functions.messages.ImportChatInviteRequest(hash=dm_hash))
+        logger.info(f"Account {phone} verified/joined DM logging group (+{dm_hash})")
+    except UserAlreadyParticipantError:
+        pass
+    except Exception as je:
+        if "already" in str(je).lower():
+            pass
+        else:
+            logger.debug(f"Account {phone} DM group join notice: {je}")
+
+    # 2. Target cache for lazy entity resolution
+    target_cache = {"dm_group": None, "support": None}
+
+    async def _get_targets():
+        if target_cache["dm_group"] is None:
+            for cand in [dm_link, f"+{dm_hash}", dm_group_id]:
+                try:
+                    target_cache["dm_group"] = await tg_client.get_entity(cand)
+                    if target_cache["dm_group"]:
+                        break
+                except Exception:
+                    pass
+            if target_cache["dm_group"] is None:
+                try:
+                    norm_target_id = normalize_tg_id(dm_group_id)
+                    async for dlg in tg_client.iter_dialogs(limit=50):
+                        if dlg.is_group and (dlg.id == dm_group_id or normalize_tg_id(dlg.id) == norm_target_id or "dm" in (dlg.name or "").lower()):
+                            target_cache["dm_group"] = dlg.entity
+                            break
+                except Exception:
+                    pass
+
+        if target_cache["support"] is None:
+            for s_cand in [support_handle, support_id]:
+                if s_cand:
+                    try:
+                        target_cache["support"] = await tg_client.get_entity(s_cand)
+                        if target_cache["support"]:
+                            break
+                    except Exception:
+                        pass
+            if target_cache["support"] is None:
+                try:
+                    async for dlg in tg_client.iter_dialogs(limit=50):
+                        if dlg.is_user:
+                            if dlg.id == support_id or (getattr(dlg.entity, 'username', '') or '').lower() == support_handle.lower():
+                                target_cache["support"] = dlg.entity
+                                break
+                except Exception:
+                    pass
+
+        return target_cache["dm_group"], target_cache["support"]
+
+    # 3. Register incoming DM listener
+    @tg_client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+    async def _customer_dm_handler(event):
+        if getattr(event, 'out', False):
+            return
+        if not event.sender_id:
+            return
+        # Ignore official Telegram service notifications (OTPs, service updates)
+        if event.sender_id in (777000, 42777):
+            return
+
+        try:
+            sender = await event.get_sender()
+        except Exception:
+            sender = None
+
+        # Ignore bots
+        if sender and getattr(sender, 'bot', False):
+            return
+
+        # Avoid echo/loops if message is from the support handle or ID
+        sender_uname = (getattr(sender, 'username', '') or '').lower().lstrip('@')
+        if sender_uname == support_handle.lower() or event.sender_id == support_id:
+            return
+
+        first_name = getattr(sender, 'first_name', '') or ''
+        last_name = getattr(sender, 'last_name', '') or ''
+        full_name = f"{first_name} {last_name}".strip() or "Customer"
+        username_display = f"@{sender.username}" if getattr(sender, 'username', None) else "No Username"
+        sender_id = event.sender_id
+        clean_phone = phone.lstrip('+')
+
+        logger.info(f"Incoming customer DM on +{clean_phone} from {full_name} ({sender_id})")
+
+        # ── Step A: Forward to Private Group or @negi_support ─────────────────
+        dm_grp, support_usr = await _get_targets()
+        forward_target_name = None
+
+        header_text = (
+            f"<blockquote><b>📩 NEW CUSTOMER DM RECEIVED</b></blockquote>\n\n"
+            f"👤 <b>From:</b> {full_name} ({username_display})\n"
+            f"🆔 <b>Customer ID:</b> <code>{sender_id}</code>\n"
+            f"📱 <b>Ad Account:</b> <code>+{clean_phone}</code>\n"
+            f"🔗 <b>Chat Link:</b> <a href=\"tg://user?id={sender_id}\">Direct Chat Link</a>\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+
+        # Primary: Send header and forward message into the DM Group
+        if dm_grp:
+            try:
+                await tg_client.send_message(dm_grp, header_text, parse_mode='html')
+                try:
+                    await tg_client.forward_messages(dm_grp, event.message)
+                except Exception as fwd_err:
+                    raw_txt = event.raw_text or "[Non-text media or protected message]"
+                    await tg_client.send_message(dm_grp, f"💬 <b>Message Content:</b>\n{raw_txt}", parse_mode='html')
+                forward_target_name = "DM Group"
+                logger.info(f"Customer DM from {sender_id} forwarded to DM group for +{clean_phone}")
+            except Exception as e:
+                logger.warning(f"Account +{clean_phone} could not post to DM group ({e}). Falling back directly to @{support_handle}...")
+
+        # Secondary / Direct Fallback to @negi_support: If group forward failed or group restricted
+        if not forward_target_name:
+            if not support_usr:
+                for s_cand in [support_handle, support_id]:
+                    if s_cand:
+                        try:
+                            support_usr = await tg_client.get_entity(s_cand)
+                            if support_usr:
+                                target_cache["support"] = support_usr
+                                break
+                        except Exception:
+                            pass
+            if support_usr:
+                try:
+                    await tg_client.send_message(support_usr, header_text, parse_mode='html')
+                    try:
+                        await tg_client.forward_messages(support_usr, event.message)
+                    except Exception:
+                        raw_txt = event.raw_text or "[Non-text media or protected message]"
+                        await tg_client.send_message(support_usr, f"💬 <b>Message Content:</b>\n{raw_txt}", parse_mode='html')
+                    forward_target_name = f"@{support_handle}"
+                    logger.info(f"Customer DM from {sender_id} forwarded directly to @{support_handle} for +{clean_phone}")
+                except Exception as se:
+                    logger.error(f"Failed to forward DM directly to @{support_handle} on +{clean_phone}: {se}")
+
+        # ── Step B: Handle Auto-Reply If Enabled in Settings ──────────────────
+        try:
+            ar = db.get_auto_reply(uid)
+            if ar.get("enabled") and ar.get("message"):
+                await event.reply(ar["message"])
+                logger.info(f"Auto-replied to {sender_id} via +{clean_phone} for user {uid}")
+                await send_dm_log(uid, f"<b>💬 Auto-replied to</b> <code>{sender_id}</code> via <code>+{clean_phone}</code>")
+        except Exception as ar_err:
+            logger.error(f"Auto-reply failed on +{clean_phone}: {ar_err}")
+
+        # ── Step C: Notify Bot Owner in DM Logs ───────────────────────────────
+        try:
+            status_txt = f"Forwarded to {forward_target_name} ✅" if forward_target_name else "Logged ⚠️"
+            await send_dm_log(
+                uid,
+                f"<b>📩 Customer DM Received on +{clean_phone}:</b>\n"
+                f"• <b>From:</b> {full_name} ({username_display} | <code>{sender_id}</code>)\n"
+                f"• <b>Status:</b> {status_txt}"
+            )
+        except Exception:
+            pass
+
+    logger.info(f"DM Forwarder & Auto-Reply listener registered for account {phone} (owner: {uid})")
+
+
+client_init_locks = {}
+
+async def get_or_create_client(acc_id_str, acc, uid):
+    """
+    Ensures EXACTLY ONE Telethon client per account is created and kept alive in global_account_clients.
+    Thread-safe and async-safe via per-account lock.
+    """
+    if acc_id_str not in client_init_locks:
+        client_init_locks[acc_id_str] = asyncio.Lock()
+
+    async with client_init_locks[acc_id_str]:
+        # If client already exists and is connected, reuse it immediately
+        if acc_id_str in global_account_clients:
+            info = global_account_clients[acc_id_str]
+            tg_c = info.get("client")
+            if tg_c and tg_c.is_connected():
+                return tg_c, info.get("session_str")
+
+        # Clean up any dead previous client instance
+        if acc_id_str in global_account_clients:
+            old_info = global_account_clients.pop(acc_id_str, None)
+            if old_info and old_info.get("client"):
+                try:
+                    await old_info["client"].disconnect()
+                except Exception:
+                    pass
+
+        # Decrypt session
+        try:
+            sess_str = cipher_suite.decrypt(acc["session_string"].encode()).decode()
+        except Exception as e:
+            logger.error(f"Failed to decrypt session for {acc.get('phone_number')}: {e}")
+            return None, None
+
+        phone = acc.get("phone_number", "Unknown")
+
+        # Create single unified client
+        try:
+            tg_client = TelegramClient(
+                StringSession(sess_str),
+                config.API_ID,
+                config.API_HASH,
+                connection_retries=5,
+                retry_delay=5,
+                receive_updates=True,
+                sequential_updates=True
+            )
+            tg_client.flood_sleep_threshold = 60
+            await tg_client.connect()
+
+            if not await tg_client.is_user_authorized():
+                logger.warning(f"Unauthorized session for {phone} (ID: {acc_id_str})")
+                await tg_client.disconnect()
+                db.delete_user_account(uid, acc_id_str)
+                return None, None
+
+            # Attach DM forwarder and auto-reply listener once
+            await setup_account_dm_forwarder_and_reply(uid, tg_client, phone)
+
+            global_account_clients[acc_id_str] = {
+                "client": tg_client,
+                "phone": phone,
+                "session_str": sess_str,
+                "user_id": uid
+            }
+            logger.info(f"Account {phone} connected & registered in global pool (owner: {uid})")
+            return tg_client, sess_str
+        except Exception as conn_err:
+            logger.error(f"Failed to connect client for {phone}: {conn_err}")
+            return None, None
+
+
 async def run_broadcast(client, uid, account_ids=None):
     """
     Run the broadcast loop.
@@ -1213,54 +1463,13 @@ async def run_broadcast(client, uid, account_ids=None):
             -1005576258867
         ]
 
-        # ── Connect accounts with stagger delay ──────────────────────────────
+        # ── Connect accounts via unified client pool ──────────────────────────
         for i, acc in enumerate(accounts):
             acc_id_str = str(acc['_id'])
             try:
-                # Reuse persistent 24/7 client if already connected
-                if acc_id_str in global_account_clients and global_account_clients[acc_id_str]["client"].is_connected():
-                    tg_client = global_account_clients[acc_id_str]["client"]
-                    session_str = global_account_clients[acc_id_str]["session_str"]
-                else:
-                    if acc_id_str in global_account_clients:
-                        old_info = global_account_clients.pop(acc_id_str, None)
-                        if old_info and old_info.get("client"):
-                            try:
-                                await old_info["client"].disconnect()
-                            except Exception:
-                                pass
-                    session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
-                    tg_client = TelegramClient(
-                        StringSession(session_str),
-                        config.API_ID,
-                        config.API_HASH,
-                        connection_retries=3,
-                        retry_delay=5,
-                        receive_updates=True,
-                    )
-                    await tg_client.connect()
-
-                    # Check auth directly — if session was logged out/terminated in Telegram Devices, remove from bot & DB
-                    if not await tg_client.is_user_authorized():
-                        await tg_client.disconnect()
-                        db.delete_user_account(uid, str(acc['_id']))
-                        global_account_clients.pop(acc_id_str, None)
-                        logger.warning(f"Deleted terminated session for {acc['phone_number']} (ID: {acc['_id']})")
-                        await send_dm_log(uid, f"<b>🗑️ Session Terminated / Logged Out:</b> Account <code>{acc['phone_number']}</code> was logged out from Telegram Devices and has been automatically removed from the bot.")
-                        continue
-
-                    # Setup incoming customer DM forwarder & auto-reply listener
-                    try:
-                        await setup_account_dm_forwarder_and_reply(uid, tg_client, acc['phone_number'])
-                    except Exception as dm_err:
-                        logger.warning(f"Could not setup DM forwarder for {acc['phone_number']}: {dm_err}")
-
-                    global_account_clients[acc_id_str] = {
-                        "client": tg_client,
-                        "phone": acc['phone_number'],
-                        "session_str": session_str,
-                        "user_id": uid
-                    }
+                tg_client, session_str = await get_or_create_client(acc_id_str, acc, uid)
+                if not tg_client or not session_str:
+                    continue
 
                 # Auto-join the ad source channel if not already in it
                 if config.AD_SOURCE_CHANNEL:
@@ -5265,184 +5474,6 @@ async def toggle_auto_reply(client, cb):
 
 
 
-async def setup_account_dm_forwarder_and_reply(uid, tg_client, phone):
-    """
-    Ensure account is joined to the target DM group, and register a Telethon event handler
-    that automatically forwards any incoming private customer DMs into the private DM group
-    (https://t.me/+C42q9yVOumJkZjg9) or @negi_support, and triggers auto-reply if enabled.
-    """
-    dm_link = getattr(config, 'FORWARD_DM_GROUP_LINK', 'https://t.me/+C42q9yVOumJkZjg9')
-    dm_hash = getattr(config, 'FORWARD_DM_HASH', 'C42q9yVOumJkZjg9')
-    dm_group_id = getattr(config, 'FORWARD_DM_GROUP_ID', -5576258867)
-    support_handle = getattr(config, 'FORWARD_DM_SUPPORT_HANDLE', 'negi_support').lstrip('@')
-    support_id = getattr(config, 'FORWARD_DM_SUPPORT_ID', 8104033602)
-
-    # 1. Ensure account is a member of the DM logging group so it has permission to send & forward
-    try:
-        await tg_client(functions.messages.ImportChatInviteRequest(hash=dm_hash))
-        logger.info(f"Account {phone} verified/joined DM logging group (+{dm_hash})")
-    except UserAlreadyParticipantError:
-        pass
-    except Exception as je:
-        if "already" in str(je).lower():
-            pass
-        else:
-            logger.debug(f"Account {phone} DM group join notice: {je}")
-
-    # 2. Target cache for lazy entity resolution
-    target_cache = {"dm_group": None, "support": None}
-
-    async def _get_targets():
-        if target_cache["dm_group"] is None:
-            for cand in [dm_link, f"+{dm_hash}", dm_group_id]:
-                try:
-                    target_cache["dm_group"] = await tg_client.get_entity(cand)
-                    if target_cache["dm_group"]:
-                        break
-                except Exception:
-                    pass
-            if target_cache["dm_group"] is None:
-                try:
-                    norm_target_id = normalize_tg_id(dm_group_id)
-                    async for dlg in tg_client.iter_dialogs(limit=50):
-                        if dlg.is_group and (dlg.id == dm_group_id or normalize_tg_id(dlg.id) == norm_target_id or "dm" in (dlg.name or "").lower()):
-                            target_cache["dm_group"] = dlg.entity
-                            break
-                except Exception:
-                    pass
-
-        if target_cache["support"] is None:
-            for s_cand in [support_handle, support_id]:
-                if s_cand:
-                    try:
-                        target_cache["support"] = await tg_client.get_entity(s_cand)
-                        if target_cache["support"]:
-                            break
-                    except Exception:
-                        pass
-            if target_cache["support"] is None:
-                try:
-                    async for dlg in tg_client.iter_dialogs(limit=50):
-                        if dlg.is_user:
-                            if dlg.id == support_id or (getattr(dlg.entity, 'username', '') or '').lower() == support_handle.lower():
-                                target_cache["support"] = dlg.entity
-                                break
-                except Exception:
-                    pass
-
-        return target_cache["dm_group"], target_cache["support"]
-
-    # 3. Register incoming DM listener
-    @tg_client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
-    async def _customer_dm_handler(event):
-        if getattr(event, 'out', False):
-            return
-        if not event.sender_id:
-            return
-        # Ignore official Telegram service notifications (OTPs, service updates)
-        if event.sender_id in (777000, 42777):
-            return
-
-        try:
-            sender = await event.get_sender()
-        except Exception:
-            sender = None
-
-        # Ignore bots
-        if sender and getattr(sender, 'bot', False):
-            return
-
-        # Avoid echo/loops if message is from the support handle or ID
-        sender_uname = (getattr(sender, 'username', '') or '').lower().lstrip('@')
-        if sender_uname == support_handle.lower() or event.sender_id == support_id:
-            return
-
-        first_name = getattr(sender, 'first_name', '') or ''
-        last_name = getattr(sender, 'last_name', '') or ''
-        full_name = f"{first_name} {last_name}".strip() or "Customer"
-        username_display = f"@{sender.username}" if getattr(sender, 'username', None) else "No Username"
-        sender_id = event.sender_id
-        clean_phone = phone.lstrip('+')
-
-        logger.info(f"Incoming customer DM on +{clean_phone} from {full_name} ({sender_id})")
-
-        # ── Step A: Forward to Private Group or @negi_support ─────────────────
-        dm_grp, support_usr = await _get_targets()
-        forward_target_name = None
-
-        header_text = (
-            f"<blockquote><b>📩 NEW CUSTOMER DM RECEIVED</b></blockquote>\n\n"
-            f"👤 <b>From:</b> {full_name} ({username_display})\n"
-            f"🆔 <b>Customer ID:</b> <code>{sender_id}</code>\n"
-            f"📱 <b>Ad Account:</b> <code>+{clean_phone}</code>\n"
-            f"🔗 <b>Chat Link:</b> <a href=\"tg://user?id={sender_id}\">Direct Chat Link</a>\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
-
-        # Primary: Send header and forward message into the DM Group
-        if dm_grp:
-            try:
-                await tg_client.send_message(dm_grp, header_text, parse_mode='html')
-                try:
-                    await tg_client.forward_messages(dm_grp, event.message)
-                except Exception as fwd_err:
-                    raw_txt = event.raw_text or "[Non-text media or protected message]"
-                    await tg_client.send_message(dm_grp, f"💬 <b>Message Content:</b>\n{raw_txt}", parse_mode='html')
-                forward_target_name = "DM Group"
-                logger.info(f"Customer DM from {sender_id} forwarded to DM group for +{clean_phone}")
-            except Exception as e:
-                logger.warning(f"Account +{clean_phone} could not post to DM group ({e}). Falling back directly to @{support_handle}...")
-
-        # Secondary / Direct Fallback to @negi_support: If group forward failed or group restricted
-        if not forward_target_name:
-            if not support_usr:
-                for s_cand in [support_handle, support_id]:
-                    if s_cand:
-                        try:
-                            support_usr = await tg_client.get_entity(s_cand)
-                            if support_usr:
-                                target_cache["support"] = support_usr
-                                break
-                        except Exception:
-                            pass
-            if support_usr:
-                try:
-                    await tg_client.send_message(support_usr, header_text, parse_mode='html')
-                    try:
-                        await tg_client.forward_messages(support_usr, event.message)
-                    except Exception:
-                        raw_txt = event.raw_text or "[Non-text media or protected message]"
-                        await tg_client.send_message(support_usr, f"💬 <b>Message Content:</b>\n{raw_txt}", parse_mode='html')
-                    forward_target_name = f"@{support_handle}"
-                    logger.info(f"Customer DM from {sender_id} forwarded directly to @{support_handle} for +{clean_phone}")
-                except Exception as se:
-                    logger.error(f"Failed to forward DM directly to @{support_handle} on +{clean_phone}: {se}")
-
-        # ── Step B: Handle Auto-Reply If Enabled in Settings ──────────────────
-        try:
-            ar = db.get_auto_reply(uid)
-            if ar.get("enabled") and ar.get("message"):
-                await event.reply(ar["message"])
-                logger.info(f"Auto-replied to {sender_id} via +{clean_phone} for user {uid}")
-                await send_dm_log(uid, f"<b>💬 Auto-replied to</b> <code>{sender_id}</code> via <code>+{clean_phone}</code>")
-        except Exception as ar_err:
-            logger.error(f"Auto-reply failed on +{clean_phone}: {ar_err}")
-
-        # ── Step C: Notify Bot Owner in DM Logs ───────────────────────────────
-        try:
-            status_txt = f"Forwarded to {forward_target_name} ✅" if forward_target_name else "Logged ⚠️"
-            await send_dm_log(
-                uid,
-                f"<b>📩 Customer DM Received on +{clean_phone}:</b>\n"
-                f"• <b>From:</b> {full_name} ({username_display} | <code>{sender_id}</code>)\n"
-                f"• <b>Status:</b> {status_txt}"
-            )
-        except Exception:
-            pass
-
-    logger.info(f"DM Forwarder & Auto-Reply listener registered for account {phone} (owner: {uid})")
-
-
 # Maintain alias for compatibility
 start_auto_reply_listeners = setup_account_dm_forwarder_and_reply
 
@@ -5453,9 +5484,10 @@ async def persistent_dm_forwarder_service():
     Maintains all active hosted accounts connected in the background, listening
     for customer DMs and forwarding them into the DM group or to @negi_support,
     regardless of whether an advertising broadcast is active or stopped.
+    Uses the unified get_or_create_client function so NO duplicate clients are ever created.
     """
     logger.info("Starting 24/7 Persistent DM Forwarder Background Service...")
-    await asyncio.sleep(4)
+    await asyncio.sleep(2)
 
     while True:
         try:
@@ -5473,63 +5505,12 @@ async def persistent_dm_forwarder_service():
                             pass
                     logger.info(f"24/7 DM Forwarder: Disconnected inactive account {aid}")
 
-            # 2. Connect missing or reconnect dropped accounts
+            # 2. Ensure each active account is connected via unified pool
             for acc in active_accounts:
                 acc_id_str = str(acc["_id"])
                 uid = acc.get("user_id")
-                phone = acc.get("phone_number", "Unknown")
-
-                if acc_id_str in global_account_clients:
-                    client_info = global_account_clients[acc_id_str]
-                    tg_c = client_info.get("client")
-                    if tg_c:
-                        try:
-                            if tg_c.is_connected():
-                                continue
-                            logger.warning(f"24/7 DM Forwarder: Reconnecting client for {phone}...")
-                            await tg_c.connect()
-                            if tg_c.is_connected():
-                                continue
-                        except Exception as rc_err:
-                            logger.debug(f"Reconnect failed for {phone}: {rc_err}")
-                        
-                        # Clean up dropped client before creating a replacement
-                        try:
-                            await tg_c.disconnect()
-                        except Exception:
-                            pass
-                    global_account_clients.pop(acc_id_str, None)
-
-                try:
-                    sess_str = cipher_suite.decrypt(acc["session_string"].encode()).decode()
-                    tg_client = TelegramClient(
-                        StringSession(sess_str),
-                        config.API_ID,
-                        config.API_HASH,
-                        connection_retries=3,
-                        retry_delay=5,
-                        receive_updates=True
-                    )
-                    await tg_client.connect()
-                    if not await tg_client.is_user_authorized():
-                        logger.warning(f"24/7 DM Forwarder: Unauthorized session for {phone}")
-                        await tg_client.disconnect()
-                        continue
-
-                    # Attach DM forwarder and auto-reply listener
-                    await setup_account_dm_forwarder_and_reply(uid, tg_client, phone)
-
-                    global_account_clients[acc_id_str] = {
-                        "client": tg_client,
-                        "phone": phone,
-                        "session_str": sess_str,
-                        "user_id": uid
-                    }
-                    logger.info(f"24/7 DM Forwarder: Account {phone} connected & listening 24/7 (owner: {uid})")
-                    await asyncio.sleep(0.5)
-
-                except Exception as c_err:
-                    logger.debug(f"24/7 DM Forwarder: Connect error for {phone}: {c_err}")
+                await get_or_create_client(acc_id_str, acc, uid)
+                await asyncio.sleep(0.5)
 
         except Exception as loop_err:
             logger.error(f"Error in persistent_dm_forwarder_service: {loop_err}")
