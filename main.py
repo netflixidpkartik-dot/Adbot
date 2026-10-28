@@ -188,6 +188,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class TelethonWrongSessionFilter(logging.Filter):
+    """
+    Suppresses rapid flooding of 'Server replied with a wrong session ID' warnings.
+    Throttles it to at most 1 warning per 60s so unexpected packets never choke stdout or memory.
+    """
+    def __init__(self):
+        super().__init__()
+        self.last_logged = 0
+
+    def filter(self, record):
+        if "wrong session ID" in record.getMessage():
+            now = time.time()
+            if now - self.last_logged < 60:
+                return False
+            self.last_logged = now
+        return True
+
+logging.getLogger('telethon.network.mtprotosender').addFilter(TelethonWrongSessionFilter())
+
 print("Adbot Started. 🚀")
 
 # Initialize encryption key with persistence across containers
@@ -517,11 +536,18 @@ def vary_message(msg: str) -> str:
 
 
 async def safe_reconnect(tg_client, session_str, phone):
-    """Try to reconnect a dropped Telethon client. Returns True if successful."""
+    """Try to reconnect a dropped Telethon client safely without duplicate connections."""
     try:
         if tg_client.is_connected():
-            await tg_client.disconnect()
-        await asyncio.sleep(random.uniform(3, 7))
+            return True
+        sender = getattr(tg_client, '_sender', None)
+        # If Telethon is already reconnecting in background, wait for it
+        if sender and getattr(sender, '_reconnecting', False):
+            for _ in range(5):
+                await asyncio.sleep(2)
+                if tg_client.is_connected():
+                    return True
+        await asyncio.sleep(random.uniform(2, 4))
         await tg_client.connect()
         if await tg_client.is_user_authorized():
             logger.info(f"Reconnected account {phone}")
@@ -1331,30 +1357,77 @@ async def setup_account_dm_forwarder_and_reply(uid, tg_client, phone):
 
 client_init_locks = {}
 
+async def stop_and_remove_account_client(acc_id_str):
+    """
+    Cleanly stops and cancels all background tasks for a client before removing it from pool.
+    Cancels internal Telethon reconnect tasks and clears event listeners to guarantee no zombie connections.
+    """
+    info = global_account_clients.pop(str(acc_id_str), None)
+    if info and info.get("client"):
+        tg = info["client"]
+        try:
+            if hasattr(tg, '_event_builders'):
+                tg._event_builders.clear()
+            sender = getattr(tg, '_sender', None)
+            if sender:
+                reconnect_task = getattr(sender, '_reconnect_task', None)
+                if reconnect_task and not reconnect_task.done():
+                    reconnect_task.cancel()
+            await tg.disconnect()
+        except Exception:
+            pass
+
+
 async def get_or_create_client(acc_id_str, acc, uid):
     """
     Ensures EXACTLY ONE Telethon client per account is created and kept alive in global_account_clients.
+    Never creates duplicate clients for the same account session.
     Thread-safe and async-safe via per-account lock.
     """
+    acc_id_str = str(acc_id_str)
     if acc_id_str not in client_init_locks:
         client_init_locks[acc_id_str] = asyncio.Lock()
 
     async with client_init_locks[acc_id_str]:
-        # If client already exists and is connected, reuse it immediately
+        # If client already exists in global pool, reuse it permanently
         if acc_id_str in global_account_clients:
             info = global_account_clients[acc_id_str]
             tg_c = info.get("client")
-            if tg_c and tg_c.is_connected():
-                return tg_c, info.get("session_str")
+            if tg_c:
+                # If connected, reuse directly
+                if tg_c.is_connected():
+                    return tg_c, info.get("session_str")
 
-        # Clean up any dead previous client instance
-        if acc_id_str in global_account_clients:
-            old_info = global_account_clients.pop(acc_id_str, None)
-            if old_info and old_info.get("client"):
+                # If disconnected, attempt to connect the existing client
+                sender = getattr(tg_c, '_sender', None)
+                is_reconn = sender and getattr(sender, '_reconnecting', False)
+                if not is_reconn:
+                    try:
+                        await tg_c.connect()
+                    except Exception as conn_err:
+                        logger.warning(f"Client {info.get('phone')} reconnect attempt: {conn_err}")
+
+                if tg_c.is_connected():
+                    return tg_c, info.get("session_str")
+
+                # If sender is actively reconnecting in background, wait or return existing
+                if sender and getattr(sender, '_reconnecting', False):
+                    return tg_c, info.get("session_str")
+
+                # Only if session is revoked/unregistered by Telegram do we remove it
                 try:
-                    await old_info["client"].disconnect()
-                except Exception:
-                    pass
+                    if await tg_c.is_user_authorized():
+                        return tg_c, info.get("session_str")
+                except Exception as auth_err:
+                    err_s = str(auth_err).lower()
+                    if any(term in err_s for term in ("unregistered", "revoked", "expired", "deactivated")):
+                        logger.warning(f"Session for {info.get('phone')} revoked/unregistered: {auth_err}")
+                        await stop_and_remove_account_client(acc_id_str)
+                        db.delete_user_account(uid, acc_id_str)
+                        return None, None
+
+                # Otherwise, keep existing client alive so Telethon's auto-reconnect handles it
+                return tg_c, info.get("session_str")
 
         # Decrypt session
         try:
@@ -1381,7 +1454,7 @@ async def get_or_create_client(acc_id_str, acc, uid):
 
             if not await tg_client.is_user_authorized():
                 logger.warning(f"Unauthorized session for {phone} (ID: {acc_id_str})")
-                await tg_client.disconnect()
+                await stop_and_remove_account_client(acc_id_str)
                 db.delete_user_account(uid, acc_id_str)
                 return None, None
 
@@ -1399,6 +1472,7 @@ async def get_or_create_client(acc_id_str, acc, uid):
         except Exception as conn_err:
             logger.error(f"Failed to connect client for {phone}: {conn_err}")
             return None, None
+
 
 
 async def run_broadcast(client, uid, account_ids=None):
@@ -2667,13 +2741,8 @@ async def delete_account(client, cb):
     acc_id = cb.data.replace("delete_acc_", "")
     try:
         db.delete_user_account(uid, acc_id)
-        # Immediately disconnect from 24/7 DM forwarder
-        info = global_account_clients.pop(str(acc_id), None)
-        if info and info.get("client"):
-            try:
-                await info["client"].disconnect()
-            except Exception:
-                pass
+        # Immediately cleanly disconnect from pool and forwarder
+        await stop_and_remove_account_client(acc_id)
         await cb.message.edit_caption(
             caption="""<blockquote><b> Account deleted!</b></blockquote>\n\n"""
                     """Account removed successfully.✅""",
@@ -2876,25 +2945,8 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
         acc_id = acc['_id']
         tg_client = None
         try:
-            # Decrypt session string
-            try:
-                session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
-            except Exception as dec_err:
-                fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Decrypt error: {str(dec_err)[:60]}")
-                logger.error(f"Bio: failed to decrypt session for {phone}: {dec_err}")
-                continue
-
-            tg_client = TelegramClient(
-                StringSession(session_str),
-                config.API_ID,
-                config.API_HASH,
-                connection_retries=2,
-                retry_delay=3
-            )
-            await tg_client.connect()
-            if not await tg_client.is_user_authorized():
-                await tg_client.disconnect()
-                db.delete_user_account(uid, str(acc_id))
+            tg_client, _ = await get_or_create_client(str(acc_id), acc, uid)
+            if not tg_client or not await tg_client.is_user_authorized():
                 fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Session logged out / removed from bot")
                 continue
 
@@ -2913,8 +2965,6 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
                 pass
 
             db.update_account_bio(acc_id, new_bio)
-            await tg_client.disconnect()
-            tg_client = None
 
             if verified_bio == new_bio.strip() or (not new_bio and not verified_bio):
                 success_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ✅ Bio updated & verified")
@@ -2934,12 +2984,7 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
                 err_msg = "Exceeds 70-character limit"
             fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ {err_msg[:80]}")
             logger.error(f"Failed to update bio for {phone}: {traceback.format_exc()}")
-        finally:
-            if tg_client:
-                try:
-                    await tg_client.disconnect()
-                except Exception:
-                    pass
+
 
         if len(targets) > 1 and idx % 2 == 0:
             try:
@@ -3181,18 +3226,8 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
         name = get_account_display_name(acc)
         acc_id = acc['_id']
         try:
-            session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
-            tg_client = TelegramClient(
-                StringSession(session_str),
-                config.API_ID,
-                config.API_HASH,
-                connection_retries=2,
-                retry_delay=3
-            )
-            await tg_client.connect()
-            if not await tg_client.is_user_authorized():
-                await tg_client.disconnect()
-                db.delete_user_account(uid, str(acc_id))
+            tg_client, _ = await get_or_create_client(str(acc_id), acc, uid)
+            if not tg_client or not await tg_client.is_user_authorized():
                 fail_list.append(f"• <b>{name}</b> (<code>{phone}</code>): ❌ Session logged out / removed from bot")
                 continue
 
@@ -3364,7 +3399,6 @@ async def perform_join_folder(client, uid, input_text, account_ids=None):
             # 4. Ensure 'groups' folder filter on account
             await ensure_groups_folder(tg_client, newly_joined_peers)
 
-            await tg_client.disconnect()
             logger.info(f"Finished group join for {phone}: {account_joined_count} joined/synced, {account_muted_count} muted")
 
             if account_joined_count > 0 or account_muted_count > 0:
@@ -3511,18 +3545,14 @@ async def sync_groups_all_cb(client, cb):
         ph = acc.get("phone_number", "Unknown")
         name = get_account_display_name(acc)
         try:
-            session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
-            tg_c = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
-            await tg_c.connect()
-            if await tg_c.is_user_authorized():
+            tg_c, _ = await get_or_create_client(acc_id, acc, uid)
+            if tg_c and await tg_c.is_user_authorized():
                 connected_clients[acc_id] = (tg_c, ph, name)
                 acc_grps = []
                 async for dlg in tg_c.iter_dialogs(limit=100):
                     if dlg.is_group:
                         acc_grps.append((dlg.id, dlg.name, getattr(dlg.entity, 'username', None)))
                 account_groups[acc_id] = acc_grps
-            else:
-                await tg_c.disconnect()
         except Exception as e:
             logger.warning(f"Sync: could not connect {ph}: {e}")
 
@@ -3576,13 +3606,6 @@ async def sync_groups_all_cb(client, cb):
 
         if joined_this_acc > 0:
             synced_details.append(f"• <b>{name}</b> (<code>{ph}</code>): Joined +{joined_this_acc} missing group(s)")
-
-    # Disconnect clients
-    for acc_id, (tg_c, _, _) in connected_clients.items():
-        try:
-            await tg_c.disconnect()
-        except Exception:
-            pass
 
     summary_text = (
         "<blockquote><b>╰_╯ GROUP SYNC COMPLETE! 🔄</b></blockquote>\n\n"
@@ -3649,18 +3672,8 @@ async def leave_muted_groups_all_cb(client, cb):
             continue
 
         try:
-            session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
-            tg_client = TelegramClient(
-                StringSession(session_str),
-                config.API_ID,
-                config.API_HASH,
-                connection_retries=2,
-                retry_delay=3,
-                receive_updates=False,
-            )
-            await tg_client.connect()
-            if not await tg_client.is_user_authorized():
-                await tg_client.disconnect()
+            tg_client, _ = await get_or_create_client(str(acc['_id']), acc, uid)
+            if not tg_client or not await tg_client.is_user_authorized():
                 continue
 
             acc_left = 0
@@ -3698,7 +3711,6 @@ async def leave_muted_groups_all_cb(client, cb):
                     elif is_r and not should_l:
                         logger.info(f"Account {name} ({phone}) kept in group {dialog.name} ({dialog.id}): {r_reason}")
 
-            await tg_client.disconnect()
             account_results.append(f"• <b>{name}</b> (<code>{phone}</code>): Left <b>{acc_left}</b> group(s)/channel(s)")
 
         except Exception as e:
@@ -4531,14 +4543,18 @@ async def account_health_check_cb(client, cb):
             terminated_count += 1
             return f"• <b>{name}</b>: 🔴 Inactive"
 
-        async with sem:
-            tg_c = None
-            try:
-                session_str = cipher_suite.decrypt(acc['session_string'].encode()).decode()
-                tg_c = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
-                await asyncio.wait_for(tg_c.connect(), timeout=8.0)
+        acc_id_str = str(acc_id)
+        if acc_id_str in global_account_clients:
+            info = global_account_clients[acc_id_str]
+            tg = info.get("client")
+            if tg and tg.is_connected():
+                active_healthy_count += 1
+                return f"• <b>{name}</b>: 🟢 Healthy & Ready"
 
-                if not await tg_c.is_user_authorized():
+        async with sem:
+            try:
+                tg_c, _ = await get_or_create_client(acc_id, acc, uid)
+                if not tg_c or not await tg_c.is_user_authorized():
                     terminated_count += 1
                     db.deactivate_account(acc_id)
                     return f"• <b>{name}</b>: 🔴 Logged Out"
@@ -4559,12 +4575,6 @@ async def account_health_check_cb(client, cb):
                     else:
                         terminated_count += 1
                         return f"• <b>{name}</b>: 🔴 Inactive"
-            finally:
-                if tg_c:
-                    try:
-                        await tg_c.disconnect()
-                    except Exception:
-                        pass
 
     scan_tasks = [check_single_account(acc) for acc in accounts]
     account_results = await asyncio.gather(*scan_tasks)
@@ -5497,12 +5507,7 @@ async def persistent_dm_forwarder_service():
             # 1. Clean up removed or deactivated accounts
             for aid in list(global_account_clients.keys()):
                 if str(aid) not in current_active_ids:
-                    info = global_account_clients.pop(aid, None)
-                    if info and info.get("client"):
-                        try:
-                            await info["client"].disconnect()
-                        except Exception:
-                            pass
+                    await stop_and_remove_account_client(aid)
                     logger.info(f"24/7 DM Forwarder: Disconnected inactive account {aid}")
 
             # 2. Ensure each active account is connected via unified pool
