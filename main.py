@@ -2462,7 +2462,8 @@ async def menu_main(client, cb):
              InlineKeyboardButton("Stop Ads⏸️", callback_data="stop_broadcast")],
             [InlineKeyboardButton("Analytics 📊", callback_data="analytics"),
              InlineKeyboardButton("Delete Accounts 🗑️", callback_data="delete_accounts")],
-            [InlineKeyboardButton("🎭 Chinese Identity Reset (Names/Pics/Posts) 🇨🇳", callback_data="reset_identity_menu")]
+            [InlineKeyboardButton("🎭 Chinese Identity Reset (Names/Pics/Posts) 🇨🇳", callback_data="reset_identity_menu")],
+            [InlineKeyboardButton("✏️ Change Bio for All Accounts 📝", callback_data="change_bio_menu")]
         ]
         
         try:
@@ -2669,6 +2670,7 @@ async def view_accounts(client, cb):
         
         caption += "\n<blockquote>╰_╯Choose an action:</blockquote>"
         buttons.append([InlineKeyboardButton("🎭 Reset Identity (Chinese Names & Wipe) 🇨🇳", callback_data="reset_identity_menu")])
+        buttons.append([InlineKeyboardButton("✏️ Change Bio for All Accounts 📝", callback_data="change_bio_menu")])
         buttons.append([InlineKeyboardButton("Add Account ➕", callback_data="host_account")])
         if is_owner(uid):
             buttons.append([InlineKeyboardButton("📦 Backup All Accounts (Sessions)", callback_data="backup_accounts")])
@@ -2814,9 +2816,34 @@ async def change_bio_menu(client, cb):
     )
 
     buttons = [
-        [InlineKeyboardButton("🌐 Update Bio for ALL Accounts", callback_data="edit_bio_all")]
+        [InlineKeyboardButton("🌐 Update Bio for ALL Accounts", callback_data="edit_bio_all")],
+        [InlineKeyboardButton("👤 Choose Specific Account", callback_data="change_bio_choose")],
+        [InlineKeyboardButton("🔙 Back to Dashboard", callback_data="menu_main")]
     ]
-    
+
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.warning(f"Error in change_bio_menu: {e}")
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^change_bio_choose$"))
+async def change_bio_choose(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("Please add accounts first!", show_alert=True)
+        return
+
+    caption = (
+        "<blockquote><b>👤 SELECT ACCOUNT TO CHANGE BIO</b></blockquote>\n\n"
+        "Select the account you want to update the bio for:"
+    )
+    buttons = []
     row = []
     for acc in accounts:
         acc_name = get_account_display_name(acc)
@@ -2828,7 +2855,7 @@ async def change_bio_menu(client, cb):
     if row:
         buttons.append(row)
 
-    buttons.append([InlineKeyboardButton("Back 🔙", callback_data="menu_main")])
+    buttons.append([InlineKeyboardButton("Back 🔙", callback_data="change_bio_menu")])
 
     try:
         if cb.message.photo or cb.message.caption:
@@ -2836,7 +2863,7 @@ async def change_bio_menu(client, cb):
         else:
             await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
     except Exception as e:
-        logger.warning(f"Error in change_bio_menu: {e}")
+        logger.warning(f"Error in change_bio_choose: {e}")
         await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
 
 
@@ -2853,10 +2880,13 @@ async def edit_bio_all_cb(client, cb):
         f"<blockquote><b>✏️ SET BIO FOR ALL ACCOUNTS</b></blockquote>\n\n"
         f"Please send the new Bio text below. It will be applied to <b>all {len(accounts)} hosted accounts</b>.\n\n"
         f"<i>• Max 70 characters (140 for Premium)</i>\n"
-        f"<i>• Send <code>/clear</code> to remove bio</i>\n"
+        f"<i>• Send <code>/clear</code> to remove bio from all accounts</i>\n"
         f"<i>• Send <code>/cancel</code> to abort</i>"
     )
-    buttons = [[InlineKeyboardButton("Cancel ❌", callback_data="change_bio_menu")]]
+    buttons = [
+        [InlineKeyboardButton("Cancel ❌", callback_data="change_bio_menu")],
+        [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+    ]
 
     try:
         if cb.message.photo or cb.message.caption:
