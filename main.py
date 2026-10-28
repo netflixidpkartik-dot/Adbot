@@ -3057,41 +3057,41 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 CHINESE_NAMES_POOL = [
-    # Classic / Common Chinese Names (Top Surnames + Popular Given Names)
-    "李伟", "王伟", "王芳", "李秀英", "李强", "王秀英", "张敏", "李敏", "王静", "张丽",
-    "王丽", "李静", "张强", "张秀英", "李军", "王敏", "张勇", "李艳", "王艳", "张杰",
-    "张磊", "王强", "刘洋", "王磊", "李勇", "王军", "张艳", "张涛", "李磊", "王勇",
-    "刘伟", "张平", "王平", "李刚", "王刚", "张峰", "李杰", "刘芳", "张军", "李娟",
-    "王娟", "李明", "王明", "张明", "李建国", "王建国", "张健", "李华", "王建华", "张建华",
-    "刘秀英", "李桂英", "王桂英", "刘敏", "刘静", "刘丽", "刘强", "刘军", "刘艳", "刘勇",
-    "刘杰", "刘磊", "刘平", "刘刚", "刘峰", "刘娟", "刘明", "刘建华", "刘健", "刘桂英",
-    "陈伟", "陈芳", "陈秀英", "陈敏", "陈静", "陈丽", "陈强", "陈军", "陈艳", "陈勇",
-    "陈杰", "陈磊", "陈平", "陈刚", "陈峰", "陈娟", "陈明", "陈建华", "陈健", "陈桂英",
-    "杨伟", "杨芳", "杨秀英", "杨敏", "杨静", "杨丽", "杨强", "杨军", "杨艳", "杨勇",
-    "杨杰", "杨磊", "杨平", "杨刚", "杨峰", "杨娟", "杨明", "杨建华", "杨健", "杨桂英",
-    "赵伟", "赵芳", "赵秀英", "赵敏", "赵静", "赵丽", "赵强", "赵军", "赵艳", "赵勇",
-    "赵杰", "赵磊", "赵平", "赵刚", "赵峰", "赵娟", "赵明", "赵建华", "赵健", "赵桂英",
-    "黄伟", "黄芳", "黄秀英", "黄敏", "黄静", "黄丽", "黄强", "黄军", "黄艳", "黄勇",
-    "黄杰", "黄磊", "黄平", "黄刚", "黄峰", "黄娟", "黄明", "黄建华", "黄健", "黄桂英",
-    "周伟", "周芳", "周秀英", "周敏", "周静", "周丽", "周强", "周军", "周艳", "周勇",
-    "周杰", "周磊", "周平", "周刚", "周峰", "周娟", "周明", "周建华", "周健", "周桂英",
-    "吴伟", "吴芳", "吴秀英", "吴敏", "吴静", "吴丽", "吴强", "吴军", "吴艳", "吴勇",
-    "吴杰", "吴磊", "吴平", "吴刚", "吴峰", "吴娟", "吴明", "吴建华", "吴健", "吴桂英",
-    "徐伟", "徐芳", "徐秀英", "徐敏", "徐静", "徐丽", "徐强", "徐军", "徐艳", "徐勇",
-    "徐杰", "徐磊", "徐平", "徐刚", "徐峰", "徐娟", "徐明", "徐建华", "徐健", "徐桂英",
-    "孙伟", "孙芳", "孙秀英", "孙敏", "孙静", "孙丽", "孙强", "孙军", "孙艳", "孙勇",
-    "孙杰", "孙磊", "孙平", "孙刚", "孙峰", "孙娟", "孙明", "孙建华", "孙健", "孙桂英",
-    # Modern / Business / Trendy Chinese Names
-    "林子轩", "林浩宇", "林欣怡", "林诗涵", "林俊熙", "林思颖", "林雨桐", "林博文", "林奕涵", "林梓萱",
-    "马宏博", "马晨曦", "马佳宁", "马睿博", "马铭远", "马振宇", "马嘉豪", "马晓峰", "马天佑", "马思聪",
-    "朱宇翔", "朱锦程", "朱浩然", "朱启文", "朱逸飞", "朱家诚", "朱博睿", "朱文斌", "朱泽楷", "朱海阔",
-    "胡天宇", "胡星辰", "胡靖远", "胡志航", "胡俊凯", "胡浩天", "胡彦彬", "胡雪峰", "胡润泽", "胡嘉豪",
-    "郭子涵", "郭明轩", "郭奕辰", "郭修远", "郭弘毅", "郭海涛", "郭少游", "郭振华", "郭云鹏", "郭晨阳",
-    "何景天", "何润博", "何逸凡", "何楚天", "何承德", "何志远", "何冠霖", "何向阳", "何海峰", "何明辉",
-    "高博洋", "高峻逸", "高鹏展", "高天翔", "高梓墨", "高致远", "高锦豪", "高浩森", "高宇达", "高世豪",
-    "郑子恒", "郑思成", "郑泽宇", "郑文博", "郑鸿达", "郑开泰", "郑旭东", "郑嘉辉", "郑展鹏", "郑浩然",
-    "谢弘文", "谢宇坤", "谢安然", "谢天泽", "谢智远", "谢昊天", "谢文卓", "谢嘉豪", "谢景平", "谢雨泽",
-    "韩若冰", "韩思远", "韩景程", "韩子琪", "韩振江", "韩天乐", "韩明轩", "韩嘉祥", "韩海峰", "韩俊雄"
+    # Classic / Common Chinese Names in Pinyin
+    "Lǐ Wěi", "Wáng Wěi", "Wáng Fāng", "Lǐ Xiùyīng", "Lǐ Qiáng", "Wáng Xiùyīng", "Zhāng Mǐn", "Lǐ Mǐn", "Wáng Jìng", "Zhāng Lì",
+    "Wáng Lì", "Lǐ Jìng", "Zhāng Qiáng", "Zhāng Xiùyīng", "Lǐ Jūn", "Wáng Mǐn", "Zhāng Yǒng", "Lǐ Yàn", "Wáng Yàn", "Zhāng Jié",
+    "Zhāng Lěi", "Wáng Qiáng", "Liú Yáng", "Wáng Lěi", "Lǐ Yǒng", "Wáng Jūn", "Zhāng Yàn", "Zhāng Tāo", "Lǐ Lěi", "Wáng Yǒng",
+    "Liú Wěi", "Zhāng Píng", "Wáng Píng", "Lǐ Gāng", "Wáng Gāng", "Zhāng Fēng", "Lǐ Jié", "Liú Fāng", "Zhāng Jūn", "Lǐ Juān",
+    "Wáng Juān", "Lǐ Míng", "Wáng Míng", "Zhāng Míng", "Lǐ Jiànguó", "Wáng Jiànguó", "Zhāng Jiàn", "Lǐ Huá", "Wáng Jiànhuá", "Zhāng Jiànhuá",
+    "Liú Xiùyīng", "Lǐ Guìyīng", "Wáng Guìyīng", "Liú Mǐn", "Liú Jìng", "Liú Lì", "Liú Qiáng", "Liú Jūn", "Liú Yàn", "Liú Yǒng",
+    "Liú Jié", "Liú Lěi", "Liú Píng", "Liú Gāng", "Liú Fēng", "Liú Juān", "Liú Míng", "Liú Jiànhuá", "Liú Jiàn", "Liú Guìyīng",
+    "Chén Wěi", "Chén Fāng", "Chén Xiùyīng", "Chén Mǐn", "Chén Jìng", "Chén Lì", "Chén Qiáng", "Chén Jūn", "Chén Yàn", "Chén Yǒng",
+    "Chén Jié", "Chén Lěi", "Chén Píng", "Chén Gāng", "Chén Fēng", "Chén Juān", "Chén Míng", "Chén Jiànhuá", "Chén Jiàn", "Chén Guìyīng",
+    "Yáng Wěi", "Yáng Fāng", "Yáng Xiùyīng", "Yáng Mǐn", "Yáng Jìng", "Yáng Lì", "Yáng Qiáng", "Yáng Jūn", "Yáng Yàn", "Yáng Yǒng",
+    "Yáng Jié", "Yáng Lěi", "Yáng Píng", "Yáng Gāng", "Yáng Fēng", "Yáng Juān", "Yáng Míng", "Yáng Jiànhuá", "Yáng Jiàn", "Yáng Guìyīng",
+    "Zhào Wěi", "Zhào Fāng", "Zhào Xiùyīng", "Zhào Mǐn", "Zhào Jìng", "Zhào Lì", "Zhào Qiáng", "Zhào Jūn", "Zhào Yàn", "Zhào Yǒng",
+    "Zhào Jié", "Zhào Lěi", "Zhào Píng", "Zhào Gāng", "Zhào Fēng", "Zhào Juān", "Zhào Míng", "Zhào Jiànhuá", "Zhào Jiàn", "Zhào Guìyīng",
+    "Huáng Wěi", "Huáng Fāng", "Huáng Xiùyīng", "Huáng Mǐn", "Huáng Jìng", "Huáng Lì", "Huáng Qiáng", "Huáng Jūn", "Huáng Yàn", "Huáng Yǒng",
+    "Huáng Jié", "Huáng Lěi", "Huáng Píng", "Huáng Gāng", "Huáng Fēng", "Huáng Juān", "Huáng Míng", "Huáng Jiànhuá", "Huáng Jiàn", "Huáng Guìyīng",
+    "Zhōu Wěi", "Zhōu Fāng", "Zhōu Xiùyīng", "Zhōu Mǐn", "Zhōu Jìng", "Zhōu Lì", "Zhōu Qiáng", "Zhōu Jūn", "Zhōu Yàn", "Zhōu Yǒng",
+    "Zhōu Jié", "Zhōu Lěi", "Zhōu Píng", "Zhōu Gāng", "Zhōu Fēng", "Zhōu Juān", "Zhōu Míng", "Zhōu Jiànhuá", "Zhōu Jiàn", "Zhōu Guìyīng",
+    "Wú Wěi", "Wú Fāng", "Wú Xiùyīng", "Wú Mǐn", "Wú Jìng", "Wú Lì", "Wú Qiáng", "Wú Jūn", "Wú Yàn", "Wú Yǒng",
+    "Wú Jié", "Wú Lěi", "Wú Píng", "Wú Gāng", "Wú Fēng", "Wú Juān", "Wú Míng", "Wú Jiànhuá", "Wú Jiàn", "Wú Guìyīng",
+    "Xú Wěi", "Xú Fāng", "Xú Xiùyīng", "Xú Mǐn", "Xú Jìng", "Xú Lì", "Xú Qiáng", "Xú Jūn", "Xú Yàn", "Xú Yǒng",
+    "Xú Jié", "Xú Lěi", "Xú Píng", "Xú Gāng", "Xú Fēng", "Xú Juān", "Xú Míng", "Xú Jiànhuá", "Xú Jiàn", "Xú Guìyīng",
+    "Sūn Wěi", "Sūn Fāng", "Sūn Xiùyīng", "Sūn Mǐn", "Sūn Jìng", "Sūn Lì", "Sūn Qiáng", "Sūn Jūn", "Sūn Yàn", "Sūn Yǒng",
+    "Sūn Jié", "Sūn Lěi", "Sūn Píng", "Sūn Gāng", "Sūn Fēng", "Sūn Juān", "Sūn Míng", "Sūn Jiànhuá", "Sūn Jiàn", "Sūn Guìyīng",
+    # Modern / Business / Trendy Chinese Names in Pinyin
+    "Lín Zǐxuān", "Lín Hàoyǔ", "Lín Xīnyí", "Lín Shīhán", "Lín Jùnxī", "Lín Sīyǐng", "Lín Yǔtóng", "Lín Bówén", "Lín Yìhán", "Lín Zǐxuān",
+    "Mǎ Hóngbó", "Mǎ Chénxī", "Mǎ Jiāníng", "Mǎ Ruìbó", "Mǎ Míngyuǎn", "Mǎ Zhènyǔ", "Mǎ Jiāháo", "Mǎ Xiǎofēng", "Mǎ Tiānyòu", "Mǎ Sīcōng",
+    "Zhū Yǔxiáng", "Zhū Jǐnchéng", "Zhū Hàorán", "Zhū Qǐwén", "Zhū Yìfēi", "Zhū Jiāchéng", "Zhū Bóruì", "Zhū Wénbīn", "Zhū Zékǎi", "Zhū Hǎikuò",
+    "Hú Tiānyǔ", "Hú Xīngchén", "Hú Jìngyuǎn", "Hú Zhìháng", "Hú Jùnkǎi", "Hú Hàotiān", "Hú Yànbīn", "Hú Xuěfēng", "Hú Rùnzé", "Hú Jiāháo",
+    "Guō Zǐhán", "Guō Míngxuān", "Guō Yìchén", "Guō Xiūyuǎn", "Guō Hóngyì", "Guō Hǎitāo", "Guō Shàoyóu", "Guō Zhènhuá", "Guō Yúnpéng", "Guō Chényáng",
+    "Hé Jǐngtiān", "Hé Rùnbó", "Hé Yìfán", "Hé Chǔtiān", "Hé Chéngdé", "Hé Zhìyuǎn", "Hé Guānlín", "Hé Xiàngyáng", "Hé Hǎifēng", "Hé Mínghuī",
+    "Gāo Bóyáng", "Gāo Jùnyì", "Gāo Péngzhǎn", "Gāo Tiānxiáng", "Gāo Zǐmò", "Gāo Zhìyuǎn", "Gāo Jǐnháo", "Gāo Hàosēn", "Gāo Yǔdá", "Gāo Shìháo",
+    "Zhèng Zǐhéng", "Zhèng Sīchéng", "Zhèng Zéyǔ", "Zhèng Wénbó", "Zhèng Hóngdá", "Zhèng Kāitài", "Zhèng Xùdōng", "Zhèng Jiāhuī", "Zhèng Zhǎnpéng", "Zhèng Hàorán",
+    "Xiè Hóngwén", "Xiè Yǔkūn", "Xiè Ānrán", "Xiè Tiānzé", "Xiè Zhìyuǎn", "Xiè Hàotiān", "Xiè Wénzhuó", "Xiè Jiāháo", "Xiè Jǐngpíng", "Xiè Yǔzé",
+    "Hán Ruòbīng", "Hán Sīyuǎn", "Hán Jǐngchéng", "Hán Zǐqí", "Hán Zhènjiāng", "Hán Tiānlè", "Hán Míngxuān", "Hán Jiāxiáng", "Hán Hǎifēng", "Hán Jùnxióng"
 ]
 
 
@@ -3206,7 +3206,7 @@ async def reset_identity_menu(client, cb):
     caption = (
         "<blockquote><b>╰_╯ CHINESE IDENTITY RESET 🎭🇨🇳</b></blockquote>\n\n"
         "Transform your hosted accounts with a completely fresh, authentic Chinese identity:\n\n"
-        "• 🏷️ <b>Chinese Names:</b> Randomly assigned from <b>330+ curated authentic names</b>\n"
+        "• 🏷️ <b>Chinese Names (Pinyin):</b> Randomly assigned from <b>330+ curated Pinyin names</b> (e.g. <i>Lín Hàoyǔ, Wáng Wěi, Mǎ Chénxī</i>)\n"
         "• 🖼️ <b>Profile Pictures:</b> Deletes all previous profile photos completely\n"
         "• 📝 <b>Profile Bio:</b> Cleared clean (zero old traces)\n"
         "• 📜 <b>Posts & Stories:</b> Wipes all previous stories & personal channels\n\n"
@@ -3282,7 +3282,7 @@ async def reset_identity_all_confirm_cb(client, cb):
 
     status_msg = await cb.message.reply(
         f"⏳ <b>Resetting Identities for {len(active_targets)} Account(s)...</b>\n\n"
-        "• <i>Assigning random Chinese names (from 330+ pool)...</i>\n"
+        "• <i>Assigning random Chinese Pinyin names (e.g. Lín Hàoyǔ)...</i>\n"
         "• <i>Removing profile photos...</i>\n"
         "• <i>Clearing old posts, stories, and bios...</i>\n\n"
         "<i>Please wait a moment...</i>",
@@ -3326,7 +3326,7 @@ async def reset_identity_all_confirm_cb(client, cb):
         f"• <b>Total Accounts Transformed:</b> <code>{len(success_results)}/{len(active_targets)}</code>\n"
         f"• <b>Profile Pictures Removed:</b> <code>{total_photos_wiped}</code>\n"
         f"• <b>Stories & Posts:</b> Cleared Clean ✅\n"
-        f"• <b>Names Applied:</b> Random Chinese Authentic Names\n\n"
+        f"• <b>Names Applied:</b> Authentic Chinese Pinyin Names (e.g. Lín Hàoyǔ)\n\n"
     )
 
     if success_results:
@@ -3381,7 +3381,7 @@ async def reset_identity_single_acc_cb(client, cb):
             f"<blockquote><b>╰_╯ IDENTITY RESET COMPLETE! 🎭🇨🇳</b></blockquote>\n\n"
             f"• <b>Phone:</b> <code>{phone}</code>\n"
             f"• <b>Old Name:</b> <s>{old_name}</s>\n"
-            f"• <b>New Chinese Name:</b> <b>{chosen_name}</b> ✅\n"
+            f"• <b>New Chinese Name (Pinyin):</b> <b>{chosen_name}</b> ✅\n"
             f"• <b>Profile Pictures Removed:</b> <code>{res['photos_wiped']}</code> 🗑️\n"
             f"• <b>Posts / Stories / Bio:</b> Cleared Clean ✨\n\n"
             f"<i>Account is ready with its new Chinese identity! 🚀</i>"
