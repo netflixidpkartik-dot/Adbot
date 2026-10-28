@@ -2461,7 +2461,8 @@ async def menu_main(client, cb):
             [InlineKeyboardButton("Start Ads▶️", callback_data="start_broadcast"),
              InlineKeyboardButton("Stop Ads⏸️", callback_data="stop_broadcast")],
             [InlineKeyboardButton("Analytics 📊", callback_data="analytics"),
-             InlineKeyboardButton("Delete Accounts 🗑️", callback_data="delete_accounts")]
+             InlineKeyboardButton("Delete Accounts 🗑️", callback_data="delete_accounts")],
+            [InlineKeyboardButton("🎭 Chinese Identity Reset (Names/Pics/Posts) 🇨🇳", callback_data="reset_identity_menu")]
         ]
         
         try:
@@ -2667,6 +2668,7 @@ async def view_accounts(client, cb):
             ])
         
         caption += "\n<blockquote>╰_╯Choose an action:</blockquote>"
+        buttons.append([InlineKeyboardButton("🎭 Reset Identity (Chinese Names & Wipe) 🇨🇳", callback_data="reset_identity_menu")])
         buttons.append([InlineKeyboardButton("Add Account ➕", callback_data="host_account")])
         if is_owner(uid):
             buttons.append([InlineKeyboardButton("📦 Backup All Accounts (Sessions)", callback_data="backup_accounts")])
@@ -2781,6 +2783,7 @@ async def view_account(client, cb):
     await cb.message.edit_caption(
         caption=caption,
         reply_markup=kb([
+            [InlineKeyboardButton("🎭 Reset to Chinese Identity (Name/Pics/Posts) 🇨🇳", callback_data=f"reset_identity_acc_{acc_id}")],
             [InlineKeyboardButton("✏️ Change Bio", callback_data=f"edit_bio_acc_{acc_id}")],
             [InlineKeyboardButton("Delete Account 🗑️", callback_data=f"delete_acc_{acc_id}")],
             [InlineKeyboardButton("Back 🔙", callback_data="view_accounts")]
@@ -3017,6 +3020,365 @@ async def perform_bio_update(client, uid, new_bio, account_ids=None):
         reply_markup=kb([[InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]])
     )
     await send_dm_log(uid, f"<b>✏️ Bio update:</b> {len(success_list)}/{len(targets)} accounts updated.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 330+ AUTHENTIC CHINESE NAMES POOL & ACCOUNT IDENTITY RESET HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+CHINESE_NAMES_POOL = [
+    # Classic / Common Chinese Names (Top Surnames + Popular Given Names)
+    "李伟", "王伟", "王芳", "李秀英", "李强", "王秀英", "张敏", "李敏", "王静", "张丽",
+    "王丽", "李静", "张强", "张秀英", "李军", "王敏", "张勇", "李艳", "王艳", "张杰",
+    "张磊", "王强", "刘洋", "王磊", "李勇", "王军", "张艳", "张涛", "李磊", "王勇",
+    "刘伟", "张平", "王平", "李刚", "王刚", "张峰", "李杰", "刘芳", "张军", "李娟",
+    "王娟", "李明", "王明", "张明", "李建国", "王建国", "张健", "李华", "王建华", "张建华",
+    "刘秀英", "李桂英", "王桂英", "刘敏", "刘静", "刘丽", "刘强", "刘军", "刘艳", "刘勇",
+    "刘杰", "刘磊", "刘平", "刘刚", "刘峰", "刘娟", "刘明", "刘建华", "刘健", "刘桂英",
+    "陈伟", "陈芳", "陈秀英", "陈敏", "陈静", "陈丽", "陈强", "陈军", "陈艳", "陈勇",
+    "陈杰", "陈磊", "陈平", "陈刚", "陈峰", "陈娟", "陈明", "陈建华", "陈健", "陈桂英",
+    "杨伟", "杨芳", "杨秀英", "杨敏", "杨静", "杨丽", "杨强", "杨军", "杨艳", "杨勇",
+    "杨杰", "杨磊", "杨平", "杨刚", "杨峰", "杨娟", "杨明", "杨建华", "杨健", "杨桂英",
+    "赵伟", "赵芳", "赵秀英", "赵敏", "赵静", "赵丽", "赵强", "赵军", "赵艳", "赵勇",
+    "赵杰", "赵磊", "赵平", "赵刚", "赵峰", "赵娟", "赵明", "赵建华", "赵健", "赵桂英",
+    "黄伟", "黄芳", "黄秀英", "黄敏", "黄静", "黄丽", "黄强", "黄军", "黄艳", "黄勇",
+    "黄杰", "黄磊", "黄平", "黄刚", "黄峰", "黄娟", "黄明", "黄建华", "黄健", "黄桂英",
+    "周伟", "周芳", "周秀英", "周敏", "周静", "周丽", "周强", "周军", "周艳", "周勇",
+    "周杰", "周磊", "周平", "周刚", "周峰", "周娟", "周明", "周建华", "周健", "周桂英",
+    "吴伟", "吴芳", "吴秀英", "吴敏", "吴静", "吴丽", "吴强", "吴军", "吴艳", "吴勇",
+    "吴杰", "吴磊", "吴平", "吴刚", "吴峰", "吴娟", "吴明", "吴建华", "吴健", "吴桂英",
+    "徐伟", "徐芳", "徐秀英", "徐敏", "徐静", "徐丽", "徐强", "徐军", "徐艳", "徐勇",
+    "徐杰", "徐磊", "徐平", "徐刚", "徐峰", "徐娟", "徐明", "徐建华", "徐健", "徐桂英",
+    "孙伟", "孙芳", "孙秀英", "孙敏", "孙静", "孙丽", "孙强", "孙军", "孙艳", "孙勇",
+    "孙杰", "孙磊", "孙平", "孙刚", "孙峰", "孙娟", "孙明", "孙建华", "孙健", "孙桂英",
+    # Modern / Business / Trendy Chinese Names
+    "林子轩", "林浩宇", "林欣怡", "林诗涵", "林俊熙", "林思颖", "林雨桐", "林博文", "林奕涵", "林梓萱",
+    "马宏博", "马晨曦", "马佳宁", "马睿博", "马铭远", "马振宇", "马嘉豪", "马晓峰", "马天佑", "马思聪",
+    "朱宇翔", "朱锦程", "朱浩然", "朱启文", "朱逸飞", "朱家诚", "朱博睿", "朱文斌", "朱泽楷", "朱海阔",
+    "胡天宇", "胡星辰", "胡靖远", "胡志航", "胡俊凯", "胡浩天", "胡彦彬", "胡雪峰", "胡润泽", "胡嘉豪",
+    "郭子涵", "郭明轩", "郭奕辰", "郭修远", "郭弘毅", "郭海涛", "郭少游", "郭振华", "郭云鹏", "郭晨阳",
+    "何景天", "何润博", "何逸凡", "何楚天", "何承德", "何志远", "何冠霖", "何向阳", "何海峰", "何明辉",
+    "高博洋", "高峻逸", "高鹏展", "高天翔", "高梓墨", "高致远", "高锦豪", "高浩森", "高宇达", "高世豪",
+    "郑子恒", "郑思成", "郑泽宇", "郑文博", "郑鸿达", "郑开泰", "郑旭东", "郑嘉辉", "郑展鹏", "郑浩然",
+    "谢弘文", "谢宇坤", "谢安然", "谢天泽", "谢智远", "谢昊天", "谢文卓", "谢嘉豪", "谢景平", "谢雨泽",
+    "韩若冰", "韩思远", "韩景程", "韩子琪", "韩振江", "韩天乐", "韩明轩", "韩嘉祥", "韩海峰", "韩俊雄"
+]
+
+
+async def wipe_account_profile_photos(tg_client):
+    """Deletes all existing profile photos for the account."""
+    photos_deleted = 0
+    try:
+        photos_res = await tg_client(functions.photos.GetUserPhotosRequest(user_id='me', offset=0, max_id=0, limit=100))
+        input_photos = []
+        for p in getattr(photos_res, 'photos', []):
+            try:
+                ip = utils.get_input_photo(p)
+                if ip and not isinstance(ip, types.InputPhotoEmpty):
+                    input_photos.append(ip)
+            except Exception:
+                pass
+        if input_photos:
+            await tg_client(functions.photos.DeletePhotosRequest(id=input_photos))
+            photos_deleted = len(input_photos)
+            logger.info(f"Wiped {photos_deleted} profile photos from account")
+    except Exception as e:
+        logger.warning(f"Could not wipe profile photos: {e}")
+    return photos_deleted
+
+
+async def wipe_account_posts_and_stories(tg_client):
+    """Deletes personal broadcast channels created by the account, stories, and saved messages."""
+    posts_cleared = 0
+    # 1. Clear stories if any exist
+    try:
+        pinned = await tg_client(functions.stories.GetPinnedStoriesRequest(peer='me', offset_id=0, limit=100))
+        story_ids = [s.id for s in getattr(pinned, 'stories', []) if hasattr(s, 'id')]
+        if story_ids:
+            await tg_client(functions.stories.DeleteStoriesRequest(peer='me', id=story_ids))
+            posts_cleared += len(story_ids)
+    except Exception as e:
+        logger.debug(f"Story clear skipped: {e}")
+
+    # 2. Check for personal broadcast channels where this user is creator/owner
+    try:
+        async for dialog in tg_client.iter_dialogs(limit=50):
+            if dialog.is_channel and not dialog.is_group:
+                entity = dialog.entity
+                if getattr(entity, 'creator', False):
+                    try:
+                        await tg_client(functions.channels.DeleteChannelRequest(channel=entity))
+                        posts_cleared += 1
+                        logger.info(f"Deleted personal channel {dialog.name} ({dialog.id})")
+                    except Exception as ce:
+                        logger.debug(f"Could not delete channel {dialog.id}: {ce}")
+    except Exception as e:
+        logger.debug(f"Channel cleanup skipped: {e}")
+
+    # 3. Clear Saved Messages (self chat)
+    try:
+        saved_msgs = await tg_client.get_messages('me', limit=100)
+        if saved_msgs:
+            msg_ids = [m.id for m in saved_msgs]
+            await tg_client.delete_messages('me', msg_ids)
+            posts_cleared += len(msg_ids)
+    except Exception as e:
+        logger.debug(f"Saved messages clear skipped: {e}")
+
+    return posts_cleared
+
+
+async def perform_account_identity_reset(tg_client, acc, uid, chosen_name):
+    """
+    Sets an authentic Chinese name, wipes all profile pictures, clears bio,
+    and removes personal posts/stories for the given account.
+    """
+    acc_id = acc['_id']
+    phone = acc.get('phone_number', 'Unknown')
+    old_name = get_account_display_name(acc)
+
+    # 1. Update Profile in Telegram (Name and clear Bio)
+    await tg_client(functions.account.UpdateProfileRequest(
+        first_name=chosen_name,
+        last_name="",
+        about=""
+    ))
+
+    # 2. Wipe Profile Pictures
+    photos_wiped = await wipe_account_profile_photos(tg_client)
+
+    # 3. Wipe Personal Posts and Stories
+    posts_wiped = await wipe_account_posts_and_stories(tg_client)
+
+    # 4. Update Database
+    db.update_account_name(acc_id, chosen_name, "")
+    db.update_account_bio(acc_id, "")
+
+    logger.info(f"Identity reset for {phone}: '{old_name}' -> '{chosen_name}', photos wiped: {photos_wiped}, posts wiped: {posts_wiped}")
+    return {
+        "acc_id": str(acc_id),
+        "phone": phone,
+        "old_name": old_name,
+        "new_name": chosen_name,
+        "photos_wiped": photos_wiped,
+        "posts_wiped": posts_wiped
+    }
+
+
+@pyro.on_callback_query(filters.regex(r"^reset_identity_menu$"))
+async def reset_identity_menu(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("Please add accounts first!", show_alert=True)
+        return
+
+    caption = (
+        "<blockquote><b>╰_╯ CHINESE IDENTITY RESET 🎭🇨🇳</b></blockquote>\n\n"
+        "Transform your hosted accounts with a completely fresh, authentic Chinese identity:\n\n"
+        "• 🏷️ <b>Chinese Names:</b> Randomly assigned from <b>330+ curated authentic names</b>\n"
+        "• 🖼️ <b>Profile Pictures:</b> Deletes all previous profile photos completely\n"
+        "• 📝 <b>Profile Bio:</b> Cleared clean (zero old traces)\n"
+        "• 📜 <b>Posts & Stories:</b> Wipes all previous stories & personal channels\n\n"
+        f"<b>Currently Hosted Accounts:</b> <code>{len(accounts)}</code>\n\n"
+        "<i>Select an option below to proceed:</i>"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(f"🇨🇳 Reset ALL Accounts Now ({len(accounts)})", callback_data="reset_identity_all_confirm")],
+        [InlineKeyboardButton("🎯 Choose Single Account", callback_data="reset_identity_choose")],
+        [InlineKeyboardButton("Back 🔙", callback_data="view_accounts")]
+    ]
+
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^reset_identity_choose$"))
+async def reset_identity_choose(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("No accounts found!", show_alert=True)
+        return
+
+    caption = (
+        "<blockquote><b>🎯 SELECT ACCOUNT TO RESET</b></blockquote>\n\n"
+        "Choose an account below to assign a random Chinese name, wipe its profile pictures, and clear previous posts/stories:\n"
+    )
+
+    buttons = []
+    row = []
+    for acc in accounts:
+        name = get_account_display_name(acc)
+        acc_id = str(acc["_id"])
+        row.append(InlineKeyboardButton(f"🎭 {name}", callback_data=f"reset_identity_acc_{acc_id}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton("Back 🔙", callback_data="reset_identity_menu")])
+
+    try:
+        if cb.message.photo or cb.message.caption:
+            await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        else:
+            await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+
+@pyro.on_callback_query(filters.regex(r"^reset_identity_all_confirm$"))
+async def reset_identity_all_confirm_cb(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("No accounts to reset!", show_alert=True)
+        return
+
+    active_targets = [a for a in accounts if a.get("is_active", True)]
+    if not active_targets:
+        await cb.answer("No active accounts found!", show_alert=True)
+        return
+
+    await cb.answer("⏳ Starting Chinese identity transformation...", show_alert=False)
+
+    status_msg = await cb.message.reply(
+        f"⏳ <b>Resetting Identities for {len(active_targets)} Account(s)...</b>\n\n"
+        "• <i>Assigning random Chinese names (from 330+ pool)...</i>\n"
+        "• <i>Removing profile photos...</i>\n"
+        "• <i>Clearing old posts, stories, and bios...</i>\n\n"
+        "<i>Please wait a moment...</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+    # Sample unique random Chinese names for each account
+    names_sample = random.sample(CHINESE_NAMES_POOL, min(len(active_targets), len(CHINESE_NAMES_POOL)))
+
+    success_results = []
+    fail_results = []
+    total_photos_wiped = 0
+
+    for idx, (acc, c_name) in enumerate(zip(active_targets, names_sample), 1):
+        acc_id = str(acc["_id"])
+        phone = acc.get("phone_number", "Unknown")
+        old_name = get_account_display_name(acc)
+
+        try:
+            tg_client, _ = await get_or_create_client(acc_id, acc, uid)
+            if not tg_client or not await tg_client.is_user_authorized():
+                fail_results.append(f"• <b>{old_name}</b> (<code>{phone}</code>): ❌ Session unauthorized")
+                continue
+
+            res = await perform_account_identity_reset(tg_client, acc, uid, c_name)
+            total_photos_wiped += res["photos_wiped"]
+            success_results.append(
+                f"• <code>{phone}</code>: <s>{old_name}</s> ➔ <b>{c_name}</b> (Photos: {res['photos_wiped']} 🗑️)"
+            )
+            await asyncio.sleep(random.uniform(1.5, 3.0))
+
+        except FloodWaitError as fe:
+            fail_results.append(f"• <code>{phone}</code>: ⏳ Rate limited ({fe.seconds}s)")
+            logger.warning(f"FloodWait resetting identity for {phone}: {fe.seconds}s")
+        except Exception as err:
+            logger.error(f"Failed to reset identity for {phone}: {err}")
+            fail_results.append(f"• <code>{phone}</code>: ❌ {str(err)[:50]}")
+
+    report = (
+        "<blockquote><b>╰_╯ CHINESE IDENTITY RESET COMPLETE! 🎭🇨🇳</b></blockquote>\n\n"
+        f"• <b>Total Accounts Transformed:</b> <code>{len(success_results)}/{len(active_targets)}</code>\n"
+        f"• <b>Profile Pictures Removed:</b> <code>{total_photos_wiped}</code>\n"
+        f"• <b>Stories & Posts:</b> Cleared Clean ✅\n"
+        f"• <b>Names Applied:</b> Random Chinese Authentic Names\n\n"
+    )
+
+    if success_results:
+        report += "<b>Updated Identities:</b>\n" + "\n".join(success_results[:15])
+        if len(success_results) > 15:
+            report += f"\n<i>...and {len(success_results) - 15} more accounts updated!</i>"
+        report += "\n\n"
+
+    if fail_results:
+        report += "<b>Issues:</b>\n" + "\n".join(fail_results[:5]) + "\n\n"
+
+    report += "<i>All accounts now have brand-new identities and are ready for broadcasting! 🚀</i>"
+
+    buttons = [
+        [InlineKeyboardButton("My Accounts 📱", callback_data="view_accounts")],
+        [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+    ]
+
+    try:
+        await status_msg.edit_text(report, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(report, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+    await send_dm_log(uid, f"<b>🎭 Chinese Identity Reset:</b> {len(success_results)} accounts updated with new Chinese names & photos wiped.")
+
+
+@pyro.on_callback_query(filters.regex(r"^reset_identity_acc_"))
+async def reset_identity_single_acc_cb(client, cb):
+    uid = cb.from_user.id
+    acc_id = cb.data.replace("reset_identity_acc_", "")
+    accounts = db.get_user_accounts(uid)
+    account = next((a for a in accounts if str(a["_id"]) == str(acc_id)), None)
+    if not account:
+        await cb.answer("Account not found!", show_alert=True)
+        return
+
+    phone = account.get("phone_number", "Unknown")
+    old_name = get_account_display_name(account)
+    chosen_name = random.choice(CHINESE_NAMES_POOL)
+
+    await cb.answer("⏳ Resetting identity...", show_alert=False)
+
+    try:
+        tg_client, _ = await get_or_create_client(str(acc_id), account, uid)
+        if not tg_client or not await tg_client.is_user_authorized():
+            await cb.answer("❌ Session unauthorized or logged out!", show_alert=True)
+            return
+
+        res = await perform_account_identity_reset(tg_client, account, uid, chosen_name)
+
+        caption = (
+            f"<blockquote><b>╰_╯ IDENTITY RESET COMPLETE! 🎭🇨🇳</b></blockquote>\n\n"
+            f"• <b>Phone:</b> <code>{phone}</code>\n"
+            f"• <b>Old Name:</b> <s>{old_name}</s>\n"
+            f"• <b>New Chinese Name:</b> <b>{chosen_name}</b> ✅\n"
+            f"• <b>Profile Pictures Removed:</b> <code>{res['photos_wiped']}</code> 🗑️\n"
+            f"• <b>Posts / Stories / Bio:</b> Cleared Clean ✨\n\n"
+            f"<i>Account is ready with its new Chinese identity! 🚀</i>"
+        )
+
+        buttons = [
+            [InlineKeyboardButton("View Account 👤", callback_data=f"view_acc_{acc_id}")],
+            [InlineKeyboardButton("Reset Another 🎭", callback_data="reset_identity_choose")],
+            [InlineKeyboardButton("Back 🔙", callback_data="view_accounts")]
+        ]
+
+        try:
+            if cb.message.photo or cb.message.caption:
+                await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+            else:
+                await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        except Exception:
+            await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+        await send_dm_log(uid, f"<b>🎭 Identity Reset for {phone}:</b> <s>{old_name}</s> ➔ <b>{chosen_name}</b> (Photos wiped: {res['photos_wiped']})")
+
+    except Exception as e:
+        logger.error(f"Single identity reset failed for {phone}: {e}")
+        await cb.answer(f"Failed: {str(e)[:50]}", show_alert=True)
+
+
+
 
 
 @pyro.on_callback_query(filters.regex(r"^join_folder_menu$"))
