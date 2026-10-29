@@ -6354,24 +6354,69 @@ async def auto_resume_active_broadcasts():
 
 async def periodic_memory_cleanup_daemon():
     """
-    Runs periodically to collect garbage, clear unreferenced objects,
-    and release freed memory back to the OS to maintain a low RAM footprint.
+    Aggressive memory watchdog that runs every 2 minutes:
+    1. Force-collects garbage across all generations
+    2. Logs current RSS memory usage
+    3. If RSS exceeds 400MB, force-exits with code 1 so Railway restarts us cleanly
+       (restartPolicyType=ALWAYS ensures instant recovery)
     """
     import gc
+    import resource
+    MAX_RSS_MB = 400  # hard ceiling - exit before OOM killer strikes at 512MB
+
     while True:
         try:
-            await asyncio.sleep(300)  # every 5 minutes
-            collected = gc.collect()
-            logger.debug(f"[GC] Periodic memory cleanup freed {collected} objects.")
+            await asyncio.sleep(120)  # every 2 minutes
+            # Force full GC sweep
+            gc.collect(generation=2)
+            gc.collect(generation=1)
+            gc.collect(generation=0)
+
+            # Check RSS memory
+            try:
+                rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024  # Linux: KB -> bytes
+                rss_mb = rss_bytes / (1024 * 1024)
+            except Exception:
+                rss_mb = 0
+
+            if rss_mb > 0:
+                logger.info(f"[WATCHDOG] RSS Memory: {rss_mb:.1f}MB / {MAX_RSS_MB}MB limit")
+
+            if rss_mb > MAX_RSS_MB:
+                logger.warning(f"[WATCHDOG] RSS {rss_mb:.1f}MB exceeds {MAX_RSS_MB}MB! Force-restarting to prevent OOM crash...")
+                # Gracefully disconnect all Telethon clients before exit
+                for aid, info in list(global_account_clients.items()):
+                    try:
+                        await info["client"].disconnect()
+                    except Exception:
+                        pass
+                os._exit(1)  # Hard exit - Railway ALWAYS policy will restart us
+
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.debug(f"[GC] Error in memory cleanup: {e}")
+            logger.debug(f"[WATCHDOG] Error in memory watchdog: {e}")
+
+
+async def heartbeat_logger():
+    """Logs a heartbeat every 30 minutes so we can verify the bot is alive from Railway logs."""
+    while True:
+        try:
+            await asyncio.sleep(1800)  # every 30 min
+            client_count = len(global_account_clients)
+            task_count = len(user_tasks)
+            logger.info(f"[HEARTBEAT] Bot alive | {client_count} accounts connected | {task_count} active broadcast tasks")
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
 
 
 async def main():
-    # Launch Periodic Memory Garbage Collection Daemon
+    # Launch Memory Watchdog (monitors RSS, force-restarts before OOM)
     asyncio.create_task(periodic_memory_cleanup_daemon())
+    # Launch heartbeat logger (proof-of-life every 30 min in Railway logs)
+    asyncio.create_task(heartbeat_logger())
 
     await pyro.start()
     await logger_client.start()
