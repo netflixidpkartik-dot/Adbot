@@ -188,11 +188,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Optimize Telethon: disable supergroup/channel difference fetching to keep memory low and prevent OOM
+# Optimize Telethon: cleanly bypass supergroup/channel difference fetching without busy-looping
 try:
     import telethon._updates.messagebox as mb
-    mb.MessageBox.get_channel_difference = lambda *args, **kwargs: None
-    logger.info("Telethon channel difference polling disabled for optimal memory efficiency.")
+    def _silent_get_channel_diff(self, chat_hashes):
+        entry = next((id for id in list(self.getting_diff_for) if isinstance(id, int)), None)
+        if entry:
+            try:
+                self.end_get_diff(entry)
+            except Exception:
+                self.getting_diff_for.discard(entry)
+            self.map.pop(entry, None)
+        return None
+
+    mb.MessageBox.get_channel_difference = _silent_get_channel_diff
+    logger.info("Telethon channel difference polling cleanly disabled (zero busy-loop, low memory).")
 except Exception as e:
     logger.debug(f"Telethon MessageBox patch notice: {e}")
 
@@ -6372,12 +6382,20 @@ async def periodic_memory_cleanup_daemon():
             gc.collect(generation=1)
             gc.collect(generation=0)
 
-            # Check RSS memory
+            # Check RSS memory via /proc/self/status or resource fallback
+            rss_mb = 0
             try:
-                rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024  # Linux: KB -> bytes
-                rss_mb = rss_bytes / (1024 * 1024)
+                with open('/proc/self/status', 'r') as proc_f:
+                    for pline in proc_f:
+                        if pline.startswith('VmRSS:'):
+                            rss_mb = int(pline.split()[1]) / 1024.0
+                            break
             except Exception:
-                rss_mb = 0
+                try:
+                    import resource
+                    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+                except Exception:
+                    rss_mb = 0
 
             if rss_mb > 0:
                 logger.info(f"[WATCHDOG] RSS Memory: {rss_mb:.1f}MB / {MAX_RSS_MB}MB limit")
