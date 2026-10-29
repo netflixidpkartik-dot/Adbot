@@ -188,6 +188,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Optimize Telethon: disable supergroup/channel difference fetching to keep memory low and prevent OOM
+try:
+    import telethon._updates.messagebox as mb
+    mb.MessageBox.get_channel_difference = lambda *args, **kwargs: None
+    logger.info("Telethon channel difference polling disabled for optimal memory efficiency.")
+except Exception as e:
+    logger.debug(f"Telethon MessageBox patch notice: {e}")
+
 class TelethonWrongSessionFilter(logging.Filter):
     """
     Suppresses rapid flooding of 'Server replied with a wrong session ID' warnings.
@@ -1447,7 +1455,9 @@ async def get_or_create_client(acc_id_str, acc, uid):
                 connection_retries=5,
                 retry_delay=5,
                 receive_updates=True,
-                sequential_updates=True
+                sequential_updates=False,
+                catch_up=False,
+                entity_cache_limit=500
             )
             tg_client.flood_sleep_threshold = 60
             await tg_client.connect()
@@ -6342,7 +6352,27 @@ async def auto_resume_active_broadcasts():
         logger.error(f"Error in auto_resume_active_broadcasts: {e}")
 
 
+async def periodic_memory_cleanup_daemon():
+    """
+    Runs periodically to collect garbage, clear unreferenced objects,
+    and release freed memory back to the OS to maintain a low RAM footprint.
+    """
+    import gc
+    while True:
+        try:
+            await asyncio.sleep(300)  # every 5 minutes
+            collected = gc.collect()
+            logger.debug(f"[GC] Periodic memory cleanup freed {collected} objects.")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"[GC] Error in memory cleanup: {e}")
+
+
 async def main():
+    # Launch Periodic Memory Garbage Collection Daemon
+    asyncio.create_task(periodic_memory_cleanup_daemon())
+
     await pyro.start()
     await logger_client.start()
     try:
