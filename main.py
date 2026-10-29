@@ -21,7 +21,8 @@ import string
 import re
 import json
 from datetime import datetime, timedelta, timezone
-from telethon import TelegramClient, functions, types, events
+from telethon import TelegramClient, functions, types, events, utils as tl_utils
+utils = tl_utils
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import UpdateProfileRequest, UpdateNotifySettingsRequest
 from telethon.tl.functions.users import GetFullUserRequest
@@ -2193,12 +2194,20 @@ async def run_broadcast(client, uid, account_ids=None):
                     raise asyncio.CancelledError("Broadcast stopped by user")
 
         except asyncio.CancelledError:
-            logger.info(f"Broadcast task cancelled for {uid}")
+            # Check if broadcast was stopped intentionally by user or cancelled by server restart
+            is_still_wanted = db.get_broadcast_state(uid).get("running", False)
+            if is_still_wanted:
+                logger.info(f"Broadcast task cancelled for {uid} due to server reboot/shutdown. Keeping running=True in DB for auto-resume.")
+                cancelled_by_server = True
+            else:
+                logger.info(f"Broadcast task stopped by user for {uid}")
+                cancelled_by_server = False
             raise
 
         finally:
             logger.info(f"Broadcast loop stopped for user {uid}. Accounts remain actively connected for 24/7 DM forwarding.")
-            db.set_broadcast_state(uid, running=False)
+            if not locals().get("cancelled_by_server", False):
+                db.set_broadcast_state(uid, running=False)
             if uid in user_tasks:
                 del user_tasks[uid]
 
@@ -2806,7 +2815,8 @@ async def view_account(client, cb):
         caption=caption,
         reply_markup=kb([
             [InlineKeyboardButton("🎭 Reset to Chinese Identity (Name/Pics/Posts) 🇨🇳", callback_data=f"reset_identity_acc_{acc_id}")],
-            [InlineKeyboardButton("✏️ Change Bio", callback_data=f"edit_bio_acc_{acc_id}")],
+            [InlineKeyboardButton("🖼️ Remove Profile Picture", callback_data=f"clear_pfp_acc_{acc_id}"),
+             InlineKeyboardButton("✏️ Change Bio", callback_data=f"edit_bio_acc_{acc_id}")],
             [InlineKeyboardButton("Delete Account 🗑️", callback_data=f"delete_acc_{acc_id}")],
             [InlineKeyboardButton("Back 🔙", callback_data="view_accounts")]
         ]),
@@ -3116,22 +3126,57 @@ CHINESE_NAMES_POOL = [
 
 
 async def wipe_account_profile_photos(tg_client):
-    """Deletes all existing profile photos for the account."""
+    """Deletes all existing profile photos for the account completely."""
     photos_deleted = 0
     try:
-        photos_res = await tg_client(functions.photos.GetUserPhotosRequest(user_id='me', offset=0, max_id=0, limit=100))
-        input_photos = []
-        for p in getattr(photos_res, 'photos', []):
+        # Collect photos via iter_profile_photos
+        photos = []
+        try:
+            async for p in tg_client.iter_profile_photos('me', limit=100):
+                if isinstance(p, types.Photo):
+                    photos.append(p)
+        except Exception as iter_e:
+            logger.debug(f"iter_profile_photos notice: {iter_e}")
+
+        # Fallback to GetUserPhotosRequest if iter_profile_photos found nothing
+        if not photos:
             try:
-                ip = utils.get_input_photo(p)
+                res = await tg_client(functions.photos.GetUserPhotosRequest(
+                    user_id=types.InputUserSelf(),
+                    offset=0,
+                    max_id=0,
+                    limit=100
+                ))
+                for p in getattr(res, 'photos', []):
+                    if isinstance(p, types.Photo):
+                        photos.append(p)
+            except Exception as req_e:
+                logger.debug(f"GetUserPhotosRequest notice: {req_e}")
+
+        if not photos:
+            logger.info("No profile photos found to wipe on account.")
+            return 0
+
+        input_photos = []
+        for p in photos:
+            try:
+                ip = tl_utils.get_input_photo(p)
                 if ip and not isinstance(ip, types.InputPhotoEmpty):
                     input_photos.append(ip)
             except Exception:
-                pass
+                if hasattr(p, 'id') and hasattr(p, 'access_hash') and hasattr(p, 'file_reference'):
+                    input_photos.append(types.InputPhoto(
+                        id=p.id,
+                        access_hash=p.access_hash,
+                        file_reference=p.file_reference
+                    ))
+
         if input_photos:
-            await tg_client(functions.photos.DeletePhotosRequest(id=input_photos))
+            for i in range(0, len(input_photos), 20):
+                chunk = input_photos[i:i + 20]
+                await tg_client(functions.photos.DeletePhotosRequest(id=chunk))
             photos_deleted = len(input_photos)
-            logger.info(f"Wiped {photos_deleted} profile photos from account")
+            logger.info(f"Successfully wiped {photos_deleted} profile photos from account.")
     except Exception as e:
         logger.warning(f"Could not wipe profile photos: {e}")
     return photos_deleted
@@ -3236,6 +3281,7 @@ async def reset_identity_menu(client, cb):
 
     buttons = [
         [InlineKeyboardButton(f"🇨🇳 Reset ALL Accounts Now ({len(accounts)})", callback_data="reset_identity_all_confirm")],
+        [InlineKeyboardButton("🖼️ Remove Profile Pictures for ALL Accounts", callback_data="clear_pfp_all_confirm")],
         [InlineKeyboardButton("🎯 Choose Single Account", callback_data="reset_identity_choose")],
         [InlineKeyboardButton("Back 🔙", callback_data="view_accounts")]
     ]
@@ -3430,6 +3476,115 @@ async def reset_identity_single_acc_cb(client, cb):
 
 
 
+
+
+@pyro.on_callback_query(filters.regex(r"^clear_pfp_all_confirm$"))
+async def clear_pfp_all_confirm_cb(client, cb):
+    uid = cb.from_user.id
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        await cb.answer("No accounts found!", show_alert=True)
+        return
+
+    active_targets = [a for a in accounts if a.get("is_active", True)]
+    if not active_targets:
+        await cb.answer("No active accounts found!", show_alert=True)
+        return
+
+    await cb.answer("⏳ Removing profile pictures from all accounts...", show_alert=False)
+    status_msg = await cb.message.reply(
+        f"⏳ <b>Removing Profile Pictures for {len(active_targets)} Account(s)...</b>\n\n"
+        "<i>Please wait a moment while photos are being wiped...</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+    success_count = 0
+    total_photos_wiped = 0
+    fail_list = []
+
+    for acc in active_targets:
+        acc_id = str(acc["_id"])
+        phone = acc.get("phone_number", "Unknown")
+        name = get_account_display_name(acc)
+        try:
+            tg_client, _ = await get_or_create_client(acc_id, acc, uid)
+            if not tg_client or not await tg_client.is_user_authorized():
+                fail_list.append(f"• <code>{phone}</code>: Unauthorized")
+                continue
+
+            wiped = await wipe_account_profile_photos(tg_client)
+            total_photos_wiped += wiped
+            success_count += 1
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            logger.error(f"Failed to wipe pfp for {phone}: {e}")
+            fail_list.append(f"• <code>{phone}</code>: {str(e)[:40]}")
+
+    report = (
+        "<blockquote><b>╰_╯ PROFILE PICTURES WIPED! 🖼️🗑️</b></blockquote>\n\n"
+        f"• <b>Accounts Processed:</b> <code>{success_count}/{len(active_targets)}</code>\n"
+        f"• <b>Total Profile Photos Deleted:</b> <code>{total_photos_wiped}</code>\n\n"
+    )
+    if fail_list:
+        report += "<b>Issues:</b>\n" + "\n".join(fail_list[:5]) + "\n\n"
+
+    report += "<i>All previous profile pictures have been completely removed! ✨</i>"
+
+    buttons = [
+        [InlineKeyboardButton("My Accounts 📱", callback_data="view_accounts")],
+        [InlineKeyboardButton("Dashboard 🚪", callback_data="menu_main")]
+    ]
+    try:
+        await status_msg.edit_text(report, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+    except Exception:
+        await cb.message.reply(report, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+    await send_dm_log(uid, f"<b>🖼️ Profile Pictures Wiped:</b> {total_photos_wiped} photos deleted across {success_count} accounts.")
+
+
+@pyro.on_callback_query(filters.regex(r"^clear_pfp_acc_"))
+async def clear_pfp_single_acc_cb(client, cb):
+    uid = cb.from_user.id
+    acc_id = cb.data.replace("clear_pfp_acc_", "")
+    accounts = db.get_user_accounts(uid)
+    account = next((a for a in accounts if str(a["_id"]) == str(acc_id)), None)
+    if not account:
+        await cb.answer("Account not found!", show_alert=True)
+        return
+
+    phone = account.get("phone_number", "Unknown")
+    await cb.answer("⏳ Removing profile picture...", show_alert=False)
+
+    try:
+        tg_client, _ = await get_or_create_client(str(acc_id), account, uid)
+        if not tg_client or not await tg_client.is_user_authorized():
+            await cb.answer("❌ Session unauthorized or logged out!", show_alert=True)
+            return
+
+        wiped = await wipe_account_profile_photos(tg_client)
+
+        caption = (
+            f"<blockquote><b>╰_╯ PROFILE PICTURE REMOVED! 🖼️🗑️</b></blockquote>\n\n"
+            f"• <b>Account:</b> <code>{phone}</code>\n"
+            f"• <b>Photos Deleted:</b> <code>{wiped}</code> 🗑️\n\n"
+            f"<i>Profile picture has been successfully cleared clean! ✨</i>"
+        )
+        buttons = [
+            [InlineKeyboardButton("View Account 👤", callback_data=f"view_acc_{acc_id}")],
+            [InlineKeyboardButton("Back 🔙", callback_data="view_accounts")]
+        ]
+        try:
+            if cb.message.photo or cb.message.caption:
+                await cb.message.edit_caption(caption=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+            else:
+                await cb.message.edit_text(text=caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+        except Exception:
+            await cb.message.reply(caption, reply_markup=kb(buttons), parse_mode=ParseMode.HTML)
+
+        await send_dm_log(uid, f"<b>🖼️ Profile Photo Wiped for {phone}:</b> {wiped} photo(s) deleted.")
+    except Exception as e:
+        logger.error(f"Failed to clear pfp for {phone}: {e}")
+        await cb.answer(f"❌ Error: {str(e)[:50]}", show_alert=True)
 
 @pyro.on_callback_query(filters.regex(r"^join_folder_menu$"))
 async def join_folder_menu(client, cb):
