@@ -1468,7 +1468,7 @@ async def get_or_create_client(acc_id_str, acc, uid):
                 receive_updates=True,
                 sequential_updates=False,
                 catch_up=False,
-                entity_cache_limit=500
+                entity_cache_limit=200
             )
             tg_client.flood_sleep_threshold = 60
             await tg_client.connect()
@@ -6087,7 +6087,7 @@ async def persistent_dm_forwarder_service():
         except Exception as loop_err:
             logger.error(f"Error in persistent_dm_forwarder_service: {loop_err}")
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(120)  # was 60s - reduced reconnect frequency to save memory
 
 
 async def _handle_telethon_phone(uid, text, m):
@@ -6519,23 +6519,36 @@ async def auto_resume_active_broadcasts():
 
 async def periodic_memory_cleanup_daemon():
     """
-    Aggressive memory watchdog that runs every 2 minutes:
-    1. Force-collects garbage across all generations
-    2. Logs current RSS memory usage
-    3. If RSS exceeds 400MB, force-exits with code 1 so Railway restarts us cleanly
-       (restartPolicyType=ALWAYS ensures instant recovery)
+    Aggressive memory watchdog - runs every 60s:
+    1. Force full GC across all generations
+    2. Evict oldest 50% of entity cache from every Telethon client
+    3. Log current RSS
+    4. If RSS > 300MB, hard-exit (Railway ALWAYS restarts us before OOM at 512MB)
     """
     import gc
-    import resource
-    MAX_RSS_MB = 400  # hard ceiling - exit before OOM killer strikes at 512MB
+    MAX_RSS_MB = 300  # exit at 300MB - 212MB buffer before Railway's 512MB OOM kill
 
     while True:
         try:
-            await asyncio.sleep(120)  # every 2 minutes
+            await asyncio.sleep(60)  # check every 60 seconds (was 120)
+
             # Force full GC sweep
             gc.collect(generation=2)
             gc.collect(generation=1)
             gc.collect(generation=0)
+
+            # Evict entity cache from all Telethon clients to reduce memory pressure
+            try:
+                for _aid, _info in list(global_account_clients.items()):
+                    _cl = _info.get("client")
+                    if _cl and hasattr(_cl, '_entity_cache'):
+                        _cache = _cl._entity_cache
+                        if hasattr(_cache, '_cache') and len(_cache._cache) > 50:
+                            _keys = list(_cache._cache.keys())
+                            for _k in _keys[:len(_keys) // 2]:
+                                _cache._cache.pop(_k, None)
+            except Exception:
+                pass
 
             # Check RSS memory via /proc/self/status or resource fallback
             rss_mb = 0
@@ -6557,13 +6570,7 @@ async def periodic_memory_cleanup_daemon():
 
             if rss_mb > MAX_RSS_MB:
                 logger.warning(f"[WATCHDOG] RSS {rss_mb:.1f}MB exceeds {MAX_RSS_MB}MB! Force-restarting to prevent OOM crash...")
-                # Gracefully disconnect all Telethon clients before exit
-                for aid, info in list(global_account_clients.items()):
-                    try:
-                        await info["client"].disconnect()
-                    except Exception:
-                        pass
-                os._exit(1)  # Hard exit - Railway ALWAYS policy will restart us
+                os._exit(1)  # Hard exit - Railway ALWAYS policy will restart us instantly
 
         except asyncio.CancelledError:
             break
