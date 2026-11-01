@@ -726,8 +726,20 @@ async def get_channel_ad_message(tg_client):
         return None, None
 
 
+async def _safe_resolve_peer(tg_client, gid):
+    """Ensure target entity/peer is known to Telethon session to prevent 'Could not find the input entity'."""
+    try:
+        return await tg_client.get_input_entity(gid)
+    except Exception:
+        try:
+            return await tg_client.get_entity(gid)
+        except Exception:
+            return gid
+
+
 async def send_ad_doc(tg_client, gid, ad_doc):
     """Send an ad message document to a group entity (supports text, photo, both, forward)."""
+    target = await _safe_resolve_peer(tg_client, gid)
     ad_type = ad_doc.get("ad_type", "text")
     caption = ad_doc.get("message", "")
     media = ad_doc.get("photo_path")
@@ -755,55 +767,67 @@ async def send_ad_doc(tg_client, gid, ad_doc):
     if media and isinstance(media, str) and not media.startswith(("http://", "https://")):
         media_exists = os.path.exists(media)
 
-    if ad_type == "forward" and from_chat and msg_id:
-        await tg_client.forward_messages(
-            entity=gid,
-            messages=msg_id,
-            from_peer=from_chat,
-            drop_author=True,
-        )
-    elif media and media_exists and ad_type in ("photo", "both"):
+    for attempt in range(2):
         try:
-            await tg_client.send_file(
-                gid, file=media, caption=varied_caption,
-                formatting_entities=tl_entities
-            )
-        except Exception as media_err:
-            m_err_str = str(media_err).lower()
-            if caption and any(k in m_err_str for k in ("sendmedia", "send_media", "chat_send_media_forbidden", "chatsendmediaforbidden", "photos_forbidden", "media_forbidden", "userbannedinchannel")):
-                logger.warning(f"Media send blocked in {gid} ({media_err}). Automatically falling back to text-only send...")
+            if ad_type == "forward" and from_chat and msg_id:
+                await tg_client.forward_messages(
+                    entity=target,
+                    messages=msg_id,
+                    from_peer=from_chat,
+                    drop_author=True,
+                )
+            elif media and media_exists and ad_type in ("photo", "both"):
+                try:
+                    await tg_client.send_file(
+                        target, file=media, caption=varied_caption,
+                        formatting_entities=tl_entities
+                    )
+                except Exception as media_err:
+                    m_err_str = str(media_err).lower()
+                    if caption and any(k in m_err_str for k in ("sendmedia", "send_media", "chat_send_media_forbidden", "chatsendmediaforbidden", "photos_forbidden", "media_forbidden", "userbannedinchannel")):
+                        logger.warning(f"Media send blocked in {gid} ({media_err}). Automatically falling back to text-only send...")
+                        await tg_client.send_message(
+                            target, varied_caption,
+                            formatting_entities=tl_entities
+                        )
+                    else:
+                        raise media_err
+            elif caption:
                 await tg_client.send_message(
-                    gid, varied_caption,
+                    target, varied_caption,
                     formatting_entities=tl_entities
                 )
+            elif media and media_exists:
+                try:
+                    await tg_client.send_file(
+                        target, file=media, caption=varied_caption,
+                        formatting_entities=tl_entities
+                    )
+                except Exception as media_err:
+                    m_err_str = str(media_err).lower()
+                    if caption and any(k in m_err_str for k in ("sendmedia", "send_media", "chat_send_media_forbidden", "chatsendmediaforbidden", "photos_forbidden", "media_forbidden", "userbannedinchannel")):
+                        logger.warning(f"Media send blocked in {gid} ({media_err}). Automatically falling back to text-only send...")
+                        await tg_client.send_message(
+                            target, varied_caption,
+                            formatting_entities=tl_entities
+                        )
+                    else:
+                        raise media_err
             else:
-                raise media_err
-    elif caption:
-        await tg_client.send_message(
-            gid, varied_caption,
-            formatting_entities=tl_entities
-        )
-    elif media and media_exists:
-        try:
-            await tg_client.send_file(
-                gid, file=media, caption=varied_caption,
-                formatting_entities=tl_entities
-            )
-        except Exception as media_err:
-            m_err_str = str(media_err).lower()
-            if caption and any(k in m_err_str for k in ("sendmedia", "send_media", "chat_send_media_forbidden", "chatsendmediaforbidden", "photos_forbidden", "media_forbidden", "userbannedinchannel")):
-                logger.warning(f"Media send blocked in {gid} ({media_err}). Automatically falling back to text-only send...")
                 await tg_client.send_message(
-                    gid, varied_caption,
+                    target, varied_caption,
                     formatting_entities=tl_entities
                 )
-            else:
-                raise media_err
-    else:
-        await tg_client.send_message(
-            gid, varied_caption,
-            formatting_entities=tl_entities
-        )
+            break
+        except Exception as send_err:
+            if attempt == 0 and "input entity" in str(send_err).lower():
+                try:
+                    logger.info(f"Resolving fresh entity from Telegram for {gid}...")
+                    target = await tg_client.get_entity(gid)
+                    continue
+                except Exception:
+                    pass
+            raise send_err
 
 
 # Track when an account last appealed to @SpamBot to avoid spamming the bot
@@ -6519,36 +6543,23 @@ async def auto_resume_active_broadcasts():
 
 async def periodic_memory_cleanup_daemon():
     """
-    Aggressive memory watchdog - runs every 60s:
-    1. Force full GC across all generations
-    2. Evict oldest 50% of entity cache from every Telethon client
-    3. Log current RSS
-    4. If RSS > 300MB, hard-exit (Railway ALWAYS restarts us before OOM at 512MB)
+    24/7 Memory Watchdog:
+    1. Force full GC sweep every 60 seconds across all generations.
+    2. Monitor RSS memory. Normal usage with 29 active accounts is 250-350MB.
+    3. Safety ceiling set to 800MB. If RSS ever exceeds 800MB, exits with code 1.
+       The runner supervisor immediately catches the exit and restarts main.py in 3s!
     """
     import gc
-    MAX_RSS_MB = 300  # exit at 300MB - 212MB buffer before Railway's 512MB OOM kill
+    MAX_RSS_MB = 800  # Generous safety ceiling - allows normal peak broadcast loads
 
     while True:
         try:
-            await asyncio.sleep(60)  # check every 60 seconds (was 120)
+            await asyncio.sleep(60)
 
             # Force full GC sweep
             gc.collect(generation=2)
             gc.collect(generation=1)
             gc.collect(generation=0)
-
-            # Evict entity cache from all Telethon clients to reduce memory pressure
-            try:
-                for _aid, _info in list(global_account_clients.items()):
-                    _cl = _info.get("client")
-                    if _cl and hasattr(_cl, '_entity_cache'):
-                        _cache = _cl._entity_cache
-                        if hasattr(_cache, '_cache') and len(_cache._cache) > 50:
-                            _keys = list(_cache._cache.keys())
-                            for _k in _keys[:len(_keys) // 2]:
-                                _cache._cache.pop(_k, None)
-            except Exception:
-                pass
 
             # Check RSS memory via /proc/self/status or resource fallback
             rss_mb = 0
@@ -6569,8 +6580,8 @@ async def periodic_memory_cleanup_daemon():
                 logger.info(f"[WATCHDOG] RSS Memory: {rss_mb:.1f}MB / {MAX_RSS_MB}MB limit")
 
             if rss_mb > MAX_RSS_MB:
-                logger.warning(f"[WATCHDOG] RSS {rss_mb:.1f}MB exceeds {MAX_RSS_MB}MB! Force-restarting to prevent OOM crash...")
-                os._exit(1)  # Hard exit - Railway ALWAYS policy will restart us instantly
+                logger.warning(f"[WATCHDOG] RSS {rss_mb:.1f}MB exceeds {MAX_RSS_MB}MB! Restarting cleanly via supervisor...")
+                os._exit(1)  # runner.py catches this and relaunches main.py in 3 seconds
 
         except asyncio.CancelledError:
             break
