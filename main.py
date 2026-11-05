@@ -1506,6 +1506,27 @@ async def get_or_create_client(acc_id_str, acc, uid):
             # Attach DM forwarder and auto-reply listener once
             await setup_account_dm_forwarder_and_reply(uid, tg_client, phone)
 
+            # Ensure Bio/About Privacy is set to Everybody (AllowAll) so users can see shop links
+            try:
+                await tg_client(functions.account.SetPrivacyRequest(
+                    key=types.InputPrivacyKeyAbout(),
+                    rules=[types.InputPrivacyValueAllowAll()]
+                ))
+                acc_bio = acc.get("bio")
+                if acc_bio:
+                    me_user = await tg_client.get_me()
+                    full_user_data = await tg_client(functions.users.GetFullUserRequest(me_user))
+                    if getattr(full_user_data.full_user, 'about', None) != acc_bio:
+                        await tg_client(functions.account.UpdateProfileRequest(
+                            first_name=me_user.first_name or "",
+                            last_name=me_user.last_name or "",
+                            about=acc_bio
+                        ))
+                        logger.info(f"Profile bio updated to '{acc_bio}' for {phone}")
+                logger.info(f"Bio/About privacy enabled (Everybody/AllowAll) for {phone}")
+            except Exception as bio_err:
+                logger.warning(f"Notice on bio/privacy sync for {phone}: {bio_err}")
+
             global_account_clients[acc_id_str] = {
                 "client": tg_client,
                 "phone": phone,
