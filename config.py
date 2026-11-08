@@ -20,7 +20,7 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
 ADMIN_IDS = [ADMIN_ID] if ADMIN_ID else []
 
 # Permanent Group Folder Link
-PERMANENT_GROUP_FOLDER = os.getenv("PERMANENT_GROUP_FOLDER", "https://t.me/addlist/GKnSP7hycVwyMjE1")
+PERMANENT_GROUP_FOLDER = os.getenv("PERMANENT_GROUP_FOLDER", "https://t.me/addlist/PjNnZHg5tC0wNTE1")
 
 # DM Forwarding Target Group & Support Handle
 FORWARD_DM_GROUP_LINK = os.getenv("FORWARD_DM_GROUP_LINK", "https://t.me/+C42q9yVOumJkZjg9")
@@ -31,13 +31,29 @@ FORWARD_DM_SUPPORT_ID = 8104033602
 
 # Master Auto-Join Group Links (Folders, Private Invite Links & Specific Groups)
 DEFAULT_GROUP_LINKS = [
-    # Specific captcha verification group (prioritized first)
-    "https://t.me/accounthubai",
+    # Master Group Folder (contains 79 clean verified groups)
+    "https://t.me/addlist/PjNnZHg5tC0wNTE1",
 
-    # Master Group Folder (replaces all previous folders)
-    "https://t.me/addlist/GKnSP7hycVwyMjE1",
+    # Pending Admin Approval Groups (Join Request Sent)
+    "https://t.me/amzvietmuaban",
+    "https://t.me/bbtgpt1",
+    "https://t.me/CLASHOFCLANS_BUY_SELL_GROUP",
+    "https://t.me/+QJCv-28Fzs5lOWM1",
+    "https://t.me/+L1AHiAB7MxAwNmE1",
+    "https://t.me/+rdn_ERmGjFFhYmNl",
+    "https://t.me/+QKrr9QvbeU9lNDE0",
 
-    # Private Invite Groups
+    # Private Group Links (t.me/+...)
+    "https://t.me/+0QqL8kDYvj5kZWU9",
+    "https://t.me/+0OQGzZGozfpiZmI1",
+    "https://t.me/+jIqbDrZ3sTkyZTU1",
+    "https://t.me/+Hy9fPyPLPEo0Mzhl",
+    "https://t.me/+X3xKPHHp5pk1Mjc9",
+    "https://t.me/+ELmqgjS-IyQwOTc1",
+    "https://t.me/+sdwPkxJ9XGFkODU0",
+    "https://t.me/+Cr9PSlMcpuNlOWQ9",
+    "https://t.me/+gQVG2lcmJXdkMjFl",
+    "https://t.me/+43XWbtOkISEwNTA1",
     "https://t.me/+C42q9yVOumJkZjg9",          # Target group for DMs
     "https://t.me/+5awfQBjtDrE4YjQ5",
     "https://t.me/+XFLGlu5QFws2MjIx",
@@ -45,11 +61,6 @@ DEFAULT_GROUP_LINKS = [
     "https://t.me/+_kM5DymPn5U2YTNh",
     "https://t.me/+hjpS3mW9xkhhMmI1",
     "https://t.me/+l8jV1bsbMq8wMDE1",
-
-    # Specific Public Groups
-    "https://t.me/asoftwarez",
-    "https://t.me/claudeProgrup",
-    "https://t.me/ngMessage",
 ]
 
 # Image URLs
