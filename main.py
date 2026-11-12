@@ -1771,9 +1771,7 @@ async def run_broadcast(client, uid, account_ids=None):
                         candidates = [aid for aid in active_acc_keys if any(g[0] == gid for g in group_cache.get(aid, []))]
                         if candidates:
                             assigned_aid = candidates[idx % len(candidates)]
-                        else:
-                            assigned_aid = active_acc_keys[idx % num_active_accs]
-                        assigned_groups[assigned_aid].append((gid, gname))
+                            assigned_groups[assigned_aid].append((gid, gname))
 
                 for aid in assigned_groups:
                     random.shuffle(assigned_groups[aid])
@@ -1897,54 +1895,16 @@ async def run_broadcast(client, uid, account_ids=None):
                                     await send_dm_log(uid, f"<b>🗑️ Session Terminated / Logged Out:</b> Account <code>{phone}</code> was logged out from Telegram Devices and has been automatically removed from the bot.")
                                     return
 
-                                # 1. PeerFlood / Spam notice / Supergroup ban notice
-                                if "peerflood" in err_full.lower() or "banned from sending messages" in err_full.lower() or "spambot" in err_full.lower():
-                                    acc_consecutive_supergroup_bans[acc_id] = acc_consecutive_supergroup_bans.get(acc_id, 0) + 1
-                                    logger.warning(f"Rate notice for {phone} in {group_name}: {err_full}. (Consecutive: {acc_consecutive_supergroup_bans[acc_id]})")
-                                    if acc_consecutive_supergroup_bans[acc_id] == 1:
-                                        await send_dm_log(uid, f"<b>⚠️ Rate Notice for {phone}:</b> {err_str[:80]} in <i>{group_name}</i>. Continuing to other groups...")
-
-                                    # Fast threshold: if account has failed 5+ groups consecutively due to global supergroup ban with ZERO successes:
-                                    if acc_consecutive_supergroup_bans[acc_id] >= 5 and acc_cycle_sent.get(acc_id, 0) == 0:
-                                        logger.warning(f"Account {phone} hit persistent global supergroup ban ({acc_consecutive_supergroup_bans[acc_id]} consecutive failures, 0 successful). Skipping account.")
-                                        async with group_lock:
-                                            rem_grps = list(assigned_groups.get(acc_id, []))
-                                            assigned_groups[acc_id] = []
-                                            other_avail = [aid for aid in active_acc_keys if aid != acc_id and aid not in banned_accounts]
-                                            if rem_grps and other_avail:
-                                                for r_idx, r_grp in enumerate(rem_grps):
-                                                    assigned_groups[other_avail[r_idx % len(other_avail)]].append(r_grp)
-                                                logger.info(f"Reassigned {len(rem_grps)} remaining groups from {phone} to {len(other_avail)} other active accounts.")
-                                        banned_accounts.add(acc_id)
-                                        skipped_accounts_cooldown[acc_id] = time.time() + 3600
-                                        db.set_account_broadcast_status(acc_id, status="skipped", cooldown_until=time.time() + 3600)
-                                        await send_dm_log(
-                                            uid,
-                                            f"<b>⏭️ Account Skipped:</b> <code>{phone}</code>\n"
-                                            f"Account is limited across supergroups (5+ consecutive failures, 0 successful sends).\n"
-                                            f"<i>Skipping this account while other healthy accounts continue broadcasting!</i>"
-                                        )
-                                        return
-
-                                    await asyncio.sleep(2)
-                                    continue
-
-                                # 2. Permanent account deactivation or ban
-                                if any(ban.lower() in err_full.lower() for ban in ("userdeactivatedban", "accountbanned")):
-                                    logger.warning(f"Account {phone} permanently banned/deactivated: {err_full}")
-                                    banned_accounts.add(acc_id)
-                                    db.deactivate_account(acc_id)
-                                    await send_dm_log(uid, f"<b>🚫 Account deactivated (banned):</b> <code>{phone}</code>\n<i>{err_str}</i>")
-                                    return
-
-                                # 2. Slowmode wait (seconds/minutes <= 48h): ignore and stay in group
-                                if "slowmode" in err_full.lower():
-                                    logger.info(f"Group {group_name} ({gid}) slowmode wait for {phone}. Staying in group.")
-                                    await send_dm_log(uid, f"<b>⏳ Slowmode wait in {group_name}:</b> {err_str[:60]}. Staying in group.")
-                                    continue
-
-                                # 3. Group-level restriction (muted, write forbidden, admin only, etc.)
-                                if any(restr.lower() in err_full.lower() for restr in GROUP_RESTRICTED_ERRORS):
+                                # 1. Group-level restriction (muted, write forbidden, admin only, channel ban, etc.)
+                                is_group_restricted = (
+                                    "userbannedinchannel" in err_full.lower() or
+                                    "chatwriteforbidden" in err_full.lower() or
+                                    "channelprivate" in err_full.lower() or
+                                    "chatadminrequired" in err_full.lower() or
+                                    "rightforbidden" in err_full.lower() or
+                                    any(restr.lower() in err_full.lower() for restr in GROUP_RESTRICTED_ERRORS)
+                                )
+                                if is_group_restricted and "slowmode" not in err_full.lower():
                                     is_temp_mute = False
                                     rem_str = ""
                                     try:
@@ -1967,22 +1927,76 @@ async def run_broadcast(client, uid, account_ids=None):
                                         logger.info(f"Group {group_name} ({gid}) is temporarily muted for {phone} ({rem_str} left, <=48h). Staying in group.")
                                         await send_dm_log(uid, f"<b>⏳ Temporarily muted in {group_name}:</b> {rem_str} remaining (<=48h). Staying in group.")
                                     else:
-                                        logger.info(f"Group {group_name} ({gid}) is permanently or >48h restricted for {phone}. Auto-exiting group...")
+                                        logger.info(f"Group {group_name} ({gid}) restricted/banned for {phone}. Auto-exiting group...")
                                         await safe_leave_group(tg_client, gid, user_id=uid)
-                                        # Remove from this account's cache and assigned list
                                         group_cache[acc_id] = [g for g in group_cache.get(acc_id, []) if g[0] != gid]
-                                        assigned_groups[acc_id] = [g for g in assigned_groups.get(acc_id, []) if g[0] != gid]
+                                        async with group_lock:
+                                            assigned_groups[acc_id] = [g for g in assigned_groups.get(acc_id, []) if g[0] != gid]
                                         await send_dm_log(
                                             uid,
                                             f"<b>🚪 Auto-Left Group:</b> <i>{group_name}</i>\n"
-                                            f"Account <code>{phone}</code> was permanently muted or muted > 48h.\n"
+                                            f"Account <code>{phone}</code> was restricted/banned in this group.\n"
                                             f"<i>Reason: {err_str[:70]}</i>\n"
-                                            f"<i>✅ Exited group automatically!</i>"
+                                            f"<i>✅ Exited dead group! Continuing to other groups...</i>"
                                         )
-                                else:
-                                    error_summary.append(f"{group_name}: {err_str}")
-                                    await send_dm_log(uid, f"<b>❌ Failed to send to {group_name}:</b> {err_str}")
+                                    await asyncio.sleep(1.5)
+                                    continue
 
+                                # 2. Slowmode wait (seconds/minutes <= 48h): ignore and stay in group
+                                if "slowmode" in err_full.lower():
+                                    logger.info(f"Group {group_name} ({gid}) slowmode wait for {phone}. Staying in group.")
+                                    await send_dm_log(uid, f"<b>⏳ Slowmode wait in {group_name}:</b> {err_str[:60]}. Staying in group.")
+                                    continue
+
+                                # 3. Permanent account deactivation or ban by Telegram
+                                if any(ban.lower() in err_full.lower() for ban in ("userdeactivatedban", "accountbanned")):
+                                    logger.warning(f"Account {phone} permanently banned/deactivated: {err_full}")
+                                    banned_accounts.add(acc_id)
+                                    db.deactivate_account(acc_id)
+                                    await send_dm_log(uid, f"<b>🚫 Account deactivated (banned):</b> <code>{phone}</code>\n<i>{err_str}</i>")
+                                    return
+
+                                # 4. Genuine account PeerFlood / SpamBot notice (EXCLUDING channel-level errors)
+                                is_peer_flood = (
+                                    "peerflood" in err_full.lower() or 
+                                    ("spambot" in err_full.lower() and "userbannedinchannel" not in err_full.lower())
+                                )
+                                if is_peer_flood:
+                                    acc_consecutive_supergroup_bans[acc_id] = acc_consecutive_supergroup_bans.get(acc_id, 0) + 1
+                                    logger.warning(f"Rate notice for {phone} in {group_name}: {err_full}. (Consecutive: {acc_consecutive_supergroup_bans[acc_id]})")
+                                    if acc_consecutive_supergroup_bans[acc_id] == 1:
+                                        await send_dm_log(uid, f"<b>⚠️ Rate Notice for {phone}:</b> {err_str[:80]} in <i>{group_name}</i>. Continuing to other groups...")
+
+                                    # Fast threshold: if account has failed 5+ groups consecutively due to global account PeerFlood with ZERO successes:
+                                    if acc_consecutive_supergroup_bans[acc_id] >= 5 and acc_cycle_sent.get(acc_id, 0) == 0:
+                                        logger.warning(f"Account {phone} hit persistent global supergroup ban ({acc_consecutive_supergroup_bans[acc_id]} consecutive failures, 0 successful). Skipping account.")
+                                        async with group_lock:
+                                            rem_grps = list(assigned_groups.get(acc_id, []))
+                                            assigned_groups[acc_id] = []
+                                            other_avail = [aid for aid in active_acc_keys if aid != acc_id and aid not in banned_accounts]
+                                            if rem_grps and other_avail:
+                                                for r_idx, r_grp in enumerate(rem_grps):
+                                                    assigned_groups[other_avail[r_idx % len(other_avail)]].append(r_grp)
+                                                logger.info(f"Reassigned {len(rem_grps)} remaining groups from {phone} to {len(other_avail)} other active accounts.")
+                                        banned_accounts.add(acc_id)
+                                        skipped_accounts_cooldown[acc_id] = time.time() + 3600
+                                        db.set_account_broadcast_status(acc_id, status="skipped", cooldown_until=time.time() + 3600)
+                                        await send_dm_log(
+                                            uid,
+                                            f"<b>⏭️ Account Skipped:</b> <code>{phone}</code>\n"
+                                            f"Account hit global Telegram rate limits (5+ consecutive PeerFlood failures).\n"
+                                            f"<i>Skipping this account while other healthy accounts continue broadcasting!</i>"
+                                        )
+                                        return
+
+                                    await asyncio.sleep(2)
+                                    continue
+
+                                # 5. Other unhandled errors
+                                error_summary.append(f"{group_name}: {err_str}")
+                                await send_dm_log(uid, f"<b>❌ Failed to send to {group_name}:</b> {err_str}")
+                                await asyncio.sleep(2)
+                                continue
                             # Safe per-account delay between its own sends (30–45 seconds)
                             per_acc_delay = random.uniform(30, 45)
                             elapsed_wait = 0.0
@@ -1996,25 +2010,30 @@ async def run_broadcast(client, uid, account_ids=None):
                         # After all assigned groups have been attempted in this cycle:
                         # Check if account was persistent and unable to post across all assigned groups
                         if acc_cycle_attempts.get(acc_id, 0) > 0 and acc_cycle_sent.get(acc_id, 0) == 0:
-                            banned_accounts.add(acc_id)
-                            skipped_accounts_cooldown[acc_id] = time.time() + 3600
-                            db.set_account_broadcast_status(acc_id, status="skipped", cooldown_until=time.time() + 3600)
-                            logger.warning(
-                                f"Account {phone} was persistent and not able to send across all {acc_cycle_attempts[acc_id]} assigned groups "
-                                f"(0 successful sends). Skipping this account from broadcasting."
-                            )
-                            await send_dm_log(
-                                uid,
-                                f"<b>⏭️ Account Skipped:</b> <code>{phone}</code>\n"
-                                f"This account was unable to post across all <b>{acc_cycle_attempts[acc_id]}</b> assigned groups (0 successful sends).\n"
-                                f"<i>Skipping this account while other healthy accounts continue broadcasting!</i>"
-                            )
+                            if len(group_cache.get(acc_id, [])) == 0:
+                                banned_accounts.add(acc_id)
+                                skipped_accounts_cooldown[acc_id] = time.time() + 3600
+                                db.set_account_broadcast_status(acc_id, status="skipped", cooldown_until=time.time() + 3600)
+                                logger.warning(
+                                    f"Account {phone} has 0 valid groups left in cache. Skipping account."
+                                )
+                                await send_dm_log(
+                                    uid,
+                                    f"<b>⏭️ Account Skipped:</b> <code>{phone}</code>\n"
+                                    f"This account has no valid open groups remaining.\n"
+                                    f"<i>Skipping this account while other healthy accounts continue broadcasting!</i>"
+                                )
+                            else:
+                                logger.info(
+                                    f"Account {phone} sent 0 ads this cycle (restricted groups pruned). "
+                                    f"Still has {len(group_cache.get(acc_id, []))} cached groups for next cycle. Keeping active!"
+                                )
+                                db.set_account_broadcast_status(acc_id, status="active", cooldown_until=0)
                         elif acc_cycle_sent.get(acc_id, 0) > 0:
                             logger.info(
                                 f"Account {phone} completed cycle successfully: posted to {acc_cycle_sent[acc_id]}/{acc_cycle_attempts.get(acc_id, 0)} groups. Keeping account active."
                             )
                             db.set_account_broadcast_status(acc_id, status="active", cooldown_until=0)
-                    except asyncio.CancelledError:
                         return
                     except Exception as ex:
                         logger.error(f"Worker exception for {phone}: {ex}")
