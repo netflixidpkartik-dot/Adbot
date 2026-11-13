@@ -10,6 +10,8 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 current_proc = None
 shutting_down = False
+WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
+MAIN_PY = os.path.join(WORKSPACE_DIR, "main.py")
 
 def handle_signal(sig, frame):
     global shutting_down, current_proc
@@ -38,6 +40,7 @@ except Exception as sig_err:
 print("================================================================")
 print("  24/7 AD-BROADCASTER BOT SUPERVISOR STARTED                    ")
 print("  Automatically keeps main.py alive 24/7 with zero downtime      ")
+print(f"  Workspace: {WORKSPACE_DIR}")
 print("================================================================")
 
 run_count = 0
@@ -47,9 +50,10 @@ while not shutting_down:
     print(f"\n[SUPERVISOR] Launching main.py (Run #{run_count}) at {now_str}...")
     start_time = time.time()
     try:
-        # Launch main.py with unbuffered output
+        # Launch main.py with unbuffered output from WORKSPACE_DIR
         current_proc = subprocess.Popen(
-            [sys.executable, "-u", "main.py"],
+            [sys.executable, "-u", MAIN_PY],
+            cwd=WORKSPACE_DIR,
             env={**os.environ, "PYTHONUNBUFFERED": "1"}
         )
         exit_code = current_proc.wait()
