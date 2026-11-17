@@ -1059,7 +1059,8 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
         pending_targets = []
         for s in folder_slugs:
             key = f"slug:{s}"
-            if key not in already_joined_keys and key not in dead_target_keys:
+            # Always check folder slugs to ensure all missing/new groups are gradually joined!
+            if key not in dead_target_keys:
                 pending_targets.append(("slug", s, key))
         for h in invite_hashes:
             key = f"hash:{h}"
@@ -1125,16 +1126,46 @@ async def auto_join_gradual_groups_for_account(tg_client, phone, uid, acc_id, ma
                                     except Exception:
                                         pass
                                 newly_joined_peers.extend(inp_peers)
-                                joined_this_cycle += 1
+                                joined_this_cycle += len(inp_peers)
                                 logger.info(f"Auto-Join: Account {phone} joined folder {target_val} ({len(inp_peers)} groups)")
+
                         elif isinstance(invite, chatlist_types.ChatlistInviteAlready):
-                            logger.info(f"Auto-Join: Account {phone} already in folder {target_val}")
+                            missing_peers = getattr(invite, 'missing_peers', [])
+                            if missing_peers:
+                                logger.info(f"Auto-Join: Account {phone} has {len(missing_peers)} missing groups in folder {target_val}. Gradually joining up to {max_joins} this cycle...")
+                                for p in missing_peers:
+                                    if joined_this_cycle >= max_joins:
+                                        break
+                                    try:
+                                        inp = await tg_client.get_input_entity(p)
+                                        await tg_client(functions.channels.JoinChannelRequest(channel=inp))
+                                        await tg_client(UpdateNotifySettingsRequest(peer=InputNotifyPeer(inp), settings=mute_settings))
+                                        newly_joined_peers.append(inp)
+                                        joined_this_cycle += 1
+                                        gid_val = getattr(p, 'channel_id', None) or getattr(p, 'chat_id', None)
+                                        if gid_val:
+                                            title = str(gid_val)
+                                            for c in getattr(invite, 'chats', []):
+                                                if c.id == gid_val:
+                                                    title = getattr(c, 'title', title)
+                                                    break
+                                            db.add_target_group(uid, -int(f"100{gid_val}") if gid_val > 0 else gid_val, title)
+                                        logger.info(f"Auto-Join: Account {phone} gradually joined missing group {title} ({joined_this_cycle}/{max_joins} this cycle)")
+                                        await asyncio.sleep(random.uniform(2.5, 4.0))
+                                    except FloodWaitError as fe:
+                                        logger.warning(f"Auto-Join FloodWait for {phone}: {fe.seconds}s. Pausing gradual joins for this cycle.")
+                                        break
+                                    except Exception as ex:
+                                        logger.debug(f"Auto-Join error on group {p} for {phone}: {ex}")
+                            else:
+                                logger.info(f"Auto-Join: Account {phone} has 100% of folder {target_val} groups joined.")
+                                db.record_account_joined_target(acc_id, target_key)
+
                     except Exception as sl_err:
                         logger.warning(f"Auto-join folder slug error for {phone} ({target_val}): {sl_err}")
                         err_str = str(sl_err).lower()
                         if any(k in err_str for k in ("expired", "invalid", "not found", "chatlist_slug_invalid", "inviteslugempty")):
                             db.mark_target_link_dead(target_key, sl_err)
-                    db.record_account_joined_target(acc_id, target_key)
 
                 elif target_type == "hash":
                     try:
@@ -4202,6 +4233,8 @@ async def sync_groups_all_cb(client, cb):
                     if isinstance(invite, chatlist_types.ChatlistInvite) and hasattr(invite, 'missing_peers') and invite.missing_peers:
                         await tg_c(chatlists.JoinChatlistInviteRequest(slug=folder_slug, peers=invite.missing_peers))
                         logger.info(f"Sync: Account {ph} joined {len(invite.missing_peers)} missing peers from saved folder")
+                    elif isinstance(invite, chatlist_types.ChatlistInviteAlready) and hasattr(invite, 'missing_peers') and invite.missing_peers:
+                        logger.info(f"Sync: Account {ph} has {len(invite.missing_peers)} missing peers in folder. Gradual auto-joiner will join them safely cycle by cycle.")
                 except Exception as fe:
                     logger.debug(f"Sync folder check for {ph}: {fe}")
                 await asyncio.sleep(1.0)
