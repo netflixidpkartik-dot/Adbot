@@ -1661,21 +1661,14 @@ async def run_broadcast(client, uid, account_ids=None):
                         ch_uname = getattr(dialog.entity, 'username', '') or ''
                         if config.AD_SOURCE_CHANNEL and (ch_uname.lower() == str(config.AD_SOURCE_CHANNEL).lstrip('@').lower() or str(dialog.id) == str(config.AD_SOURCE_CHANNEL)):
                             continue
-                        logger.info(f"Account {acc['phone_number']} auto-leaving broadcast channel {dialog.name} ({dialog.id})")
-                        await safe_leave_group(tg_client, dialog.id, user_id=uid)
-                        await asyncio.sleep(random.uniform(2.5, 4.0))
+                        logger.info(f"Account {acc['phone_number']} skipping broadcast channel {dialog.name} ({dialog.id}) at startup (will leave post-cycle)")
                         continue
 
                     if dialog.is_group:
                         # Automated check: if account is muted, banned, or write-forbidden
                         is_restr, should_leave, restr_reason = check_entity_restricted(dialog.entity)
                         if is_restr:
-                            if should_leave:
-                                logger.info(f"Account {acc['phone_number']} auto-leaving permanent/>48h group {dialog.name} ({dialog.id}): {restr_reason}")
-                                await safe_leave_group(tg_client, dialog.id, user_id=uid)
-                                await asyncio.sleep(random.uniform(2.5, 4.0))
-                            else:
-                                logger.info(f"Account {acc['phone_number']} in temporarily muted group {dialog.name} ({dialog.id}): {restr_reason}. Kept in group.")
+                            logger.info(f"Account {acc['phone_number']} skipping restricted group {dialog.name} ({dialog.id}): {restr_reason} at startup (will leave post-cycle)")
                             continue
 
                         norm_id = normalize_tg_id(dialog.id)
@@ -1694,9 +1687,6 @@ async def run_broadcast(client, uid, account_ids=None):
                         if dialog.is_group:
                             is_restr, should_leave, restr_reason = check_entity_restricted(dialog.entity)
                             if is_restr:
-                                if should_leave:
-                                    await safe_leave_group(tg_client, dialog.id, user_id=uid)
-                                    await asyncio.sleep(random.uniform(2.5, 4.0))
                                 continue
                             norm_id = normalize_tg_id(dialog.id)
                             if dialog.id in skip_group_ids or norm_id in skip_group_ids:
