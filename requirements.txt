@@ -1,6 +1,6 @@
 pyrogram
 tgcrypto
-telethon
+telethon==1.45.0
 pymongo[srv]
 dnspython
 cryptography

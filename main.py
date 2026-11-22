@@ -2032,18 +2032,38 @@ async def run_broadcast(client, uid, account_ids=None):
                         # Check if account was persistent and unable to post across all assigned groups
                         if acc_cycle_attempts.get(acc_id, 0) > 0 and acc_cycle_sent.get(acc_id, 0) == 0:
                             if len(group_cache.get(acc_id, [])) == 0:
-                                banned_accounts.add(acc_id)
-                                skipped_accounts_cooldown[acc_id] = time.time() + 3600
-                                db.set_account_broadcast_status(acc_id, status="skipped", cooldown_until=time.time() + 3600)
-                                logger.warning(
-                                    f"Account {phone} has 0 valid groups left in cache. Skipping account."
-                                )
-                                await send_dm_log(
-                                    uid,
-                                    f"<b>⏭️ Account Skipped:</b> <code>{phone}</code>\n"
-                                    f"This account has no valid open groups remaining.\n"
-                                    f"<i>Skipping this account while other healthy accounts continue broadcasting!</i>"
-                                )
+                                # Try immediate auto-join from master folder before skipping!
+                                tg_cl, _, _ = clients.get(acc_id, (None, None, None))
+                                if tg_cl:
+                                    try:
+                                        n_j = await auto_join_gradual_groups_for_account(tg_cl, phone, uid, acc_id, max_joins=3)
+                                        if n_j > 0:
+                                            new_grps = []
+                                            async for dlg in tg_cl.iter_dialogs(limit=100):
+                                                if dlg.is_group:
+                                                    is_r, _, _ = check_entity_restricted(dlg.entity)
+                                                    if not is_r:
+                                                        new_grps.append((dlg.id, dlg.name))
+                                            group_cache[acc_id] = new_grps
+                                    except Exception as aj_err:
+                                        logger.debug(f"Immediate auto-join error for {phone}: {aj_err}")
+
+                                if len(group_cache.get(acc_id, [])) == 0:
+                                    banned_accounts.add(acc_id)
+                                    skipped_accounts_cooldown[acc_id] = time.time() + 3600
+                                    db.set_account_broadcast_status(acc_id, status="skipped", cooldown_until=time.time() + 3600)
+                                    logger.warning(
+                                        f"Account {phone} has 0 valid groups left in cache. Skipping account."
+                                    )
+                                    await send_dm_log(
+                                        uid,
+                                        f"<b>⏭️ Account Skipped:</b> <code>{phone}</code>\n"
+                                        f"This account has no valid open groups remaining.\n"
+                                        f"<i>Skipping this account while other healthy accounts continue broadcasting!</i>"
+                                    )
+                                else:
+                                    logger.info(f"Account {phone} auto-joined {len(group_cache[acc_id])} groups instead of skipping. Keeping active!")
+                                    db.set_account_broadcast_status(acc_id, status="active", cooldown_until=0)
                             else:
                                 logger.info(
                                     f"Account {phone} sent 0 ads this cycle (restricted groups pruned). "
@@ -2206,13 +2226,17 @@ async def run_broadcast(client, uid, account_ids=None):
                 for aid in list(clients.keys()):
                     if not db.get_broadcast_state(uid).get("running", False):
                         break
-                    if aid in banned_accounts:
+                    # Allow skipped accounts that have 0 groups to auto-join so they can recover!
+                    if aid in banned_accounts and len(group_cache.get(aid, [])) > 0:
                         continue
                     tg_c, s_str, p_num = clients[aid]
                     try:
                         n_joined = await auto_join_gradual_groups_for_account(tg_c, p_num, uid, aid, max_joins=2)
                         if n_joined > 0:
                             maint_groups_auto_joined += n_joined
+                            banned_accounts.discard(aid)
+                            skipped_accounts_cooldown.pop(aid, None)
+                            db.set_account_broadcast_status(aid, status="active", cooldown_until=0)
                             # Refresh active groups in group_cache so newly joined groups are posted to in next cycle!
                             updated_grps = []
                             async for dlg in tg_c.iter_dialogs(limit=100):
