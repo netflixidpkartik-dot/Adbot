@@ -298,19 +298,15 @@ def kb(rows):
         raise ValueError("Rows must be a list of lists")
     return InlineKeyboardMarkup(rows)
 
-# Initialize Pyrogram clients
-adbot_session_str = os.environ.get("ADBOT_SESSION_STRING")
-logger_session_str = os.environ.get("LOGGER_BOT_SESSION_STRING")
+# Initialize Pyrogram clients with validated DC5 session strings
+DEFAULT_ADBOT_SESSION = "BQIh29MAw1OkCSiz49XdQMyOH21lNpqegUj3nCiMo3l2s7C7cVGlAi6hC-nS2omEgCL-AMuvcQIZWANbsc__0sjbpZOc5I3Dxt1hqHECmQfpo31vUGQY4jsbbTPR_jS0pbW5EknuoRk7FTzrso7FyJMu203HgdjvhpJJMkGXRRBYyc6U9yMp7ziCTejftjIWPFR4FtYjFLNo2xRaR6TLia8WoQB0fb-JDtHfA-1Jry7pOdPBQJaqVJhuEDG1NCaqlTQTbu_02LpLoWYkWvu1H6FWUmtf5olzX0fOBgpF3BOeTC8woDeHBM4q_U2URtIydGlWOF4VZEcMrJKSyRME6O6HEzSjWwAAAAIW1ZmBAQ"
+DEFAULT_LOGGER_SESSION = "BQIh29MAU2ZXubkc9hMjrMj9727UE50I3Y7QcElnnC7gImkFUoVWZvRbr1mMFpJ4AUC3vbt8J_A7UpoSHtzm951dLqDzgXMD7A9E7OAVW0a9DtslnBJB1X9-IGe3leb2_6_ac87vrXkvd6kfZ2oY6FXEFl6N9BBqmLOIVnCngKjlIgIzvXAdJLQx29UyQBerfjZoPw4V9cWV0RZFShfPQy4XdIrHAmjT2XlFGr_VdkC-c-absKLjyEFvrYO0siqdDzSkV196wYUG83EBklGiVTuyE0W4UN3oGt9mjA7ftpZN6WIneW279Lv1sz5pr5-mmyLlTy4QtxG6Ml3EGo4qizMdXKcpbgAAAAIUeXOfAQ"
 
-if adbot_session_str:
-    pyro = PyroClient("adbot", api_id=config.API_ID, api_hash=config.API_HASH, session_string=adbot_session_str)
-else:
-    pyro = PyroClient("adbot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
+adbot_session_str = os.environ.get("ADBOT_SESSION_STRING") or DEFAULT_ADBOT_SESSION
+logger_session_str = os.environ.get("LOGGER_BOT_SESSION_STRING") or DEFAULT_LOGGER_SESSION
 
-if logger_session_str:
-    logger_client = PyroClient("logger_bot", api_id=config.API_ID, api_hash=config.API_HASH, session_string=logger_session_str)
-else:
-    logger_client = PyroClient("logger_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.LOGGER_BOT_TOKEN)
+pyro = PyroClient("adbot", api_id=config.API_ID, api_hash=config.API_HASH, session_string=adbot_session_str)
+logger_client = PyroClient("logger_bot", api_id=config.API_ID, api_hash=config.API_HASH, session_string=logger_session_str)
 
 # In-memory storage for broadcast tasks
 user_tasks = {}
@@ -611,31 +607,39 @@ async def safe_leave_group(tg_client, gid, user_id=None):
     return left
 
 
+def _http_send_dm_sync(bot_token, chat_id, text):
+    import urllib.request, urllib.parse, json
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST")
+    with urllib.request.urlopen(req, timeout=5.0) as resp:
+        res = json.loads(resp.read().decode("utf-8"))
+        return res.get("ok", False)
+
 async def send_dm_log(user_id, log_message):
     if not db.get_logger_status(user_id):
         logger.info(f"User {user_id} has not started logger bot. Skipping DM log.")
         return
+    if len(log_message) > 4000:
+        log_message = log_message[:3985] + "\n\n<i>[Truncated]</i>"
+    # Primary: Send via official HTTP Bot API (100% immune to MTProto connection drops)
     try:
-        await logger_client.resolve_peer(user_id)
-        if len(log_message) > 4000:
-            log_message = log_message[:3985] + "\n\n<i>[Truncated]</i>"
-        await logger_client.send_message(user_id, log_message, parse_mode=ParseMode.HTML)
-        logger.info(f"DM log sent to {user_id}: {log_message[:50]}...")
-    except PeerIdInvalid:
-        logger.error(f"DM log failed for {user_id}: Peer not found. User must start logger bot.")
-        db.log_logger_failure(user_id, "PeerIdInvalid: User must start logger bot")
-        try:
-            await pyro.send_message(
-                user_id,
-                "<b>⚠️ Logger bot not started!</b>\n\n"
-                f"Please start @{config.LOGGER_BOT_USERNAME} to receive broadcast logs. 🌟",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb([[InlineKeyboardButton("Start Logger Bot 📩", url=f"https://t.me/{config.LOGGER_BOT_USERNAME.lstrip('@')}")]])
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify user {user_id} to start logger bot: {e}")
+        sent = await asyncio.to_thread(_http_send_dm_sync, config.LOGGER_BOT_TOKEN, user_id, log_message)
+        if sent:
+            logger.info(f"DM log sent to {user_id}: {log_message[:50]}...")
+            return
+    except Exception as http_err:
+        logger.debug(f"HTTP DM log send error for {user_id}: {http_err}")
+    # Secondary fallback: Pyrogram client with strict 3-second timeout to prevent broadcast loop freeze
+    try:
+        await asyncio.wait_for(logger_client.send_message(user_id, log_message, parse_mode=ParseMode.HTML), timeout=3.0)
+        logger.info(f"DM log sent to {user_id} via MTProto: {log_message[:50]}...")
     except Exception as e:
-        logger.error(f"DM log failed for {user_id}: {e} - Message: {log_message[:50]}...")
+        logger.warning(f"DM log failed for {user_id}: {e}")
         db.log_logger_failure(user_id, str(e))
 
 @logger_client.on_message(filters.command(["start"]))
