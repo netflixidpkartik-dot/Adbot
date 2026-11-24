@@ -310,6 +310,25 @@ logger_client = PyroClient("logger_bot", api_id=config.API_ID, api_hash=config.A
 
 # In-memory storage for broadcast tasks
 user_tasks = {}
+user_launch_locks = {}  # {uid: asyncio.Lock} to serialize per-user broadcast start/stop/reload
+global_acc_last_sent_ts = {}  # {str(acc_id): timestamp} to prevent double-send burst on reload
+global_acc_last_cycle_end_ts = {}  # {str(acc_id): timestamp} to preserve cycle cooldown across hot-reloads
+
+def _get_user_launch_lock(uid):
+    uid = int(uid)
+    lock = user_launch_locks.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        user_launch_locks[uid] = lock
+    return lock
+
+def _pick_fallback_selected(accounts):
+    """Pick a safe fallback selected account list, preferring active accounts."""
+    if not accounts:
+        return None
+    active = [a for a in accounts if a.get("is_active", True)]
+    pool = active if active else accounts
+    return [str(pool[0]['_id'])]
 
 # Global persistent Telethon clients for 24/7 DM forwarding across all hosted accounts:
 # {str(acc_id): {"client": tg_client, "phone": phone, "session_str": session_str, "user_id": uid}}
@@ -705,21 +724,25 @@ async def validate_session(session_str):
         return False
 
 async def stop_broadcast_task(uid):
-    task = user_tasks.pop(uid, None)
-    if task:
-        try:
-            task.cancel()
-            await task
-            logger.info(f"Cancelled broadcast task for {uid}")
-        except asyncio.CancelledError:
-            logger.info(f"Broadcast task for {uid} was cancelled successfully")
-        except Exception as e:
-            logger.error(f"Failed to cancel broadcast task for {uid}: {e}")
-    
-    state = db.get_broadcast_state(uid)
-    was_running = state.get("running", False)
-    db.set_broadcast_state(uid, running=False)
-    return was_running or (task is not None)
+    uid = int(uid)
+    async with _get_user_launch_lock(uid):
+        state = db.get_broadcast_state(uid)
+        was_running = state.get("running", False)
+        db.set_broadcast_state(uid, running=False)
+
+        task = user_tasks.pop(uid, None)
+        if task:
+            if not task.done():
+                task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=15.0)
+                logger.info(f"Cancelled broadcast task for {uid}")
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                logger.info(f"Broadcast task for {uid} was cancelled successfully")
+            except Exception as e:
+                logger.error(f"Failed to cancel broadcast task for {uid}: {e}")
+
+        return was_running or (task is not None)
 
 async def get_channel_ad_message(tg_client):
     """Fetch the latest message (text or media) from the owner's ad source channel."""
@@ -1466,6 +1489,29 @@ async def stop_and_remove_account_client(acc_id_str):
             pass
 
 
+async def cleanup_inactive_clients_for_user(uid):
+    """Disconnect any global_account_clients for uid that are no longer active or selected."""
+    try:
+        uid = int(uid)
+        user_accounts = db.get_user_accounts(uid)
+        selected_ids = db.get_selected_broadcast_accounts(uid)
+        is_running = db.get_broadcast_state(uid).get("running", False)
+
+        keep_ids = set()
+        for acc in user_accounts:
+            aid_s = str(acc["_id"])
+            if acc.get("is_active", True) or (is_running and selected_ids and aid_s in selected_ids):
+                keep_ids.add(aid_s)
+
+        for aid, info in list(global_account_clients.items()):
+            owner_uid = info.get("user_id")
+            if owner_uid is not None and int(owner_uid) == uid and str(aid) not in keep_ids:
+                await stop_and_remove_account_client(aid)
+                logger.info(f"Hot-reload cleanup: Disconnected inactive client {aid} ({info.get('phone')}) for user {uid}")
+    except Exception as e:
+        logger.warning(f"Error cleaning up inactive clients for user {uid}: {e}")
+
+
 async def get_or_create_client(acc_id_str, acc, uid):
     """
     Ensures EXACTLY ONE Telethon client per account is created and kept alive in global_account_clients.
@@ -1586,11 +1632,14 @@ async def get_or_create_client(acc_id_str, acc, uid):
 
 
 
-async def run_broadcast(client, uid, account_ids=None):
+async def run_broadcast(client, uid, account_ids=None, is_hot_reload=False):
     """
     Run the broadcast loop.
     account_ids: list of str account _id values to use, or None to use all.
+    is_hot_reload: True when invoked by per-user hot-reload so existing accounts preserve cooldowns.
     """
+    uid = int(uid)
+    my_task = asyncio.current_task()
     try:
         sent_count = 0
         failed_count = 0
@@ -1603,8 +1652,9 @@ async def run_broadcast(client, uid, account_ids=None):
         if account_ids:
             accounts = [a for a in all_accounts if str(a['_id']) in account_ids]
             if not accounts:
-                logger.warning(f"User {uid}: None of selected accounts {account_ids} exist in DB. Falling back to all accounts.")
-                accounts = all_accounts
+                logger.warning(f"User {uid}: None of selected accounts {account_ids} exist in DB. Falling back to active accounts.")
+                active_fallback = [a for a in all_accounts if a.get("is_active", True)]
+                accounts = active_fallback if active_fallback else all_accounts
         else:
             accounts = all_accounts
 
@@ -1741,6 +1791,7 @@ async def run_broadcast(client, uid, account_ids=None):
 
         if not clients:
             await client.send_message(uid, "╰_╯No valid accounts found!", parse_mode=ParseMode.HTML)
+            db.set_broadcast_state(uid, running=False)
             return
 
         db.set_broadcast_state(uid, running=True)
@@ -1756,7 +1807,8 @@ async def run_broadcast(client, uid, account_ids=None):
         try:
             while db.get_broadcast_state(uid).get("running", False):
 
-                # Re-read DB ad settings at start of each cycle (user may have added/removed ads)
+                # Re-read DB ad settings and delay at start of each cycle
+                delay = db.get_user_ad_delay(uid)
                 user_ads = db.get_user_ad_messages(uid)
                 ad_mode = db.get_user_ad_mode(uid)
 
@@ -1820,18 +1872,39 @@ async def run_broadcast(client, uid, account_ids=None):
                 acc_cycle_attempts = {aid: 0 for aid in active_acc_keys}
                 acc_consecutive_supergroup_bans = {aid: 0 for aid in active_acc_keys}
 
+                async def _sleep_if_running(seconds):
+                    elapsed = 0.0
+                    while elapsed < seconds:
+                        if not db.get_broadcast_state(uid).get("running", False):
+                            return False
+                        chunk = min(1.0, seconds - elapsed)
+                        await asyncio.sleep(chunk)
+                        elapsed += chunk
+                    return True
+
                 # ── Worker function for simultaneous account broadcasting ──────
                 async def broadcast_worker(acc_id, tg_client, session_str, phone, start_stagger, acc_index):
                     nonlocal sent_count, failed_count
                     try:
+                        acc_id_s = str(acc_id)
                         if start_stagger > 0:
-                            elapsed_stagger = 0.0
-                            while elapsed_stagger < start_stagger:
-                                if not db.get_broadcast_state(uid).get("running", False):
+                            if not await _sleep_if_running(start_stagger):
+                                return
+
+                        # Preserve cycle & per-send cooldowns for pre-existing accounts across hot-reload
+                        if is_hot_reload and cycle_count == 0 and acc_id_s in global_acc_last_cycle_end_ts:
+                            rem_cycle = delay - (time.time() - global_acc_last_cycle_end_ts[acc_id_s])
+                            if rem_cycle > 0:
+                                logger.info(f"Hot-reload cooldown: Account {phone} waiting {rem_cycle:.0f}s remaining cycle delay.")
+                                if not await _sleep_if_running(rem_cycle):
                                     return
-                                chunk = min(1.0, start_stagger - elapsed_stagger)
-                                await asyncio.sleep(chunk)
-                                elapsed_stagger += chunk
+
+                        if acc_id_s in global_acc_last_sent_ts:
+                            rem_send = 30.0 - (time.time() - global_acc_last_sent_ts[acc_id_s])
+                            if rem_send > 0:
+                                logger.info(f"Cooldown guard: Account {phone} waiting {rem_send:.1f}s before next send.")
+                                if not await _sleep_if_running(rem_send):
+                                    return
 
                         group_idx = 0
                         while True:
@@ -1862,6 +1935,7 @@ async def run_broadcast(client, uid, account_ids=None):
                             acc_cycle_attempts[acc_id] = acc_cycle_attempts.get(acc_id, 0) + 1
                             try:
                                 await send_ad_doc(tg_client, gid, chosen_ad_doc)
+                                global_acc_last_sent_ts[acc_id_s] = time.time()
 
                                 async with stats_lock:
                                     sent_count += 1
@@ -2113,7 +2187,14 @@ async def run_broadcast(client, uid, account_ids=None):
                     stagger_idx += 1
 
                 if worker_tasks:
-                    await asyncio.gather(*worker_tasks, return_exceptions=True)
+                    try:
+                        await asyncio.gather(*worker_tasks, return_exceptions=True)
+                    except asyncio.CancelledError:
+                        for wt in worker_tasks:
+                            if not wt.done():
+                                wt.cancel()
+                        await asyncio.gather(*worker_tasks, return_exceptions=True)
+                        raise
 
                 if not db.get_broadcast_state(uid).get("running", False):
                     break
@@ -2293,6 +2374,9 @@ async def run_broadcast(client, uid, account_ids=None):
                 logger.info(f"Post-cycle maintenance finished for user {uid}. Starting countdown for next cycle.")
 
                 cycle_count += 1
+                cycle_done_ts = time.time()
+                for c_aid in active_acc_keys:
+                    global_acc_last_cycle_end_ts[str(c_aid)] = cycle_done_ts
                 db.increment_broadcast_cycle(uid)
 
                 if error_summary:
@@ -2320,10 +2404,10 @@ async def run_broadcast(client, uid, account_ids=None):
                     raise asyncio.CancelledError("Broadcast stopped by user")
 
         except asyncio.CancelledError:
-            # Check if broadcast was stopped intentionally by user or cancelled by server restart
+            # Check if broadcast was stopped intentionally by user or cancelled by server reboot / hot-reload
             is_still_wanted = db.get_broadcast_state(uid).get("running", False)
             if is_still_wanted:
-                logger.info(f"Broadcast task cancelled for {uid} due to server reboot/shutdown. Keeping running=True in DB for auto-resume.")
+                logger.info(f"Broadcast task cancelled for {uid} (hot-reload or reboot). Keeping running=True in DB.")
                 cancelled_by_server = True
             else:
                 logger.info(f"Broadcast task stopped by user for {uid}")
@@ -2334,7 +2418,7 @@ async def run_broadcast(client, uid, account_ids=None):
             logger.info(f"Broadcast loop stopped for user {uid}. Accounts remain actively connected for 24/7 DM forwarding.")
             if not locals().get("cancelled_by_server", False):
                 db.set_broadcast_state(uid, running=False)
-            if uid in user_tasks:
+            if user_tasks.get(uid) is my_task:
                 del user_tasks[uid]
 
     except asyncio.CancelledError:
@@ -2343,8 +2427,6 @@ async def run_broadcast(client, uid, account_ids=None):
         logger.error(f"Broadcast task failed for {uid}: {e}")
         db.increment_broadcast_stats(uid, False)
         db.set_broadcast_state(uid, running=False)
-        if uid in user_tasks:
-            del user_tasks[uid]
         await send_dm_log(uid, f"<b>❌ Broadcast task failed:</b> {str(e)}")
         for admin_id in ALLOWED_BD_IDS:
             try:
@@ -2356,6 +2438,9 @@ async def run_broadcast(client, uid, account_ids=None):
                 break
             except Exception as admin_e:
                 logger.error(f"Failed to notify admin {admin_id}: {admin_e}")
+    finally:
+        if user_tasks.get(uid) is my_task:
+            del user_tasks[uid]
 
 def get_otp_keyboard():
     rows = [
@@ -4964,21 +5049,44 @@ async def noop_no_selection(client, cb):
     await cb.answer("Select at least one account first!", show_alert=True)
 
 
-async def _launch_broadcast(client, uid, account_ids=None):
-    """Internal helper: cancel any existing task and launch a new broadcast."""
-    current_task = user_tasks.get(uid)
-    if current_task:
-        try:
-            current_task.cancel()
-            await current_task
-        except Exception:
-            pass
-        finally:
-            user_tasks.pop(uid, None)
+async def _launch_broadcast(
+    client,
+    uid,
+    account_ids=None,
+    cleanup_inactive=False,
+    require_running_in_db=False,
+    is_hot_reload=False,
+):
+    """Internal helper: safely cancel any existing task for uid and launch a new broadcast."""
+    uid = int(uid)
+    async with _get_user_launch_lock(uid):
+        if require_running_in_db and not db.get_broadcast_state(uid).get("running", False):
+            logger.info(f"Aborted broadcast launch for {uid}: running became False while waiting for lock.")
+            return False
 
-    task = asyncio.create_task(run_broadcast(client, uid, account_ids=account_ids))
-    user_tasks[uid] = task
-    db.set_broadcast_state(uid, running=True)
+        # Set running=True before cancelling old task so CancelledError handler preserves running=True
+        db.set_broadcast_state(uid, running=True)
+
+        current_task = user_tasks.get(uid)
+        if current_task:
+            if not current_task.done():
+                current_task.cancel()
+            try:
+                await asyncio.wait_for(current_task, timeout=15.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+            finally:
+                if user_tasks.get(uid) is current_task:
+                    user_tasks.pop(uid, None)
+
+        if cleanup_inactive:
+            await cleanup_inactive_clients_for_user(uid)
+
+        task = asyncio.create_task(
+            run_broadcast(client, uid, account_ids=account_ids, is_hot_reload=is_hot_reload)
+        )
+        user_tasks[uid] = task
+        return True
 
 
 @pyro.on_callback_query(filters.regex("^start_bcast_selected$"))
@@ -5494,6 +5602,24 @@ async def admin_broadcast(client, m):
 @pyro.on_message(filters.command("bd") & ~filters.user(ALLOWED_BD_IDS))
 async def non_admin_bd(client, m):
     await m.reply("╰_╯Baka! command is for admins only, you are not allowed to use it.")
+
+@pyro.on_message(filters.command("reload") & filters.user(ALLOWED_BD_IDS))
+async def admin_reload_command(client, m):
+    parts = (m.text or "").split()
+    target_uid = m.from_user.id
+    if len(parts) > 1:
+        try:
+            target_uid = int(parts[1])
+        except ValueError:
+            await m.reply("Usage: <code>/reload &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
+            return
+
+    ok, msg = await _reload_single_user_broadcast(target_uid, notify_dm=True)
+    await m.reply(f"<b>{'✅' if ok else '❌'} {msg}</b>", parse_mode=ParseMode.HTML)
+
+@pyro.on_message(filters.command("reload") & ~filters.user(ALLOWED_BD_IDS))
+async def non_admin_reload(client, m):
+    await m.reply("╰_╯Baka! This command is for admins only.")
 
 @pyro.on_message(filters.command("stop"))
 async def stop_command(client, m):
@@ -6197,7 +6323,19 @@ async def persistent_dm_forwarder_service():
     while True:
         try:
             active_accounts = list(db.db.accounts.find({"is_active": True}))
-            current_active_ids = {str(a["_id"]) for a in active_accounts}
+            keep_accounts_by_id = {str(a["_id"]): a for a in active_accounts}
+
+            # Also keep any account currently selected by a running broadcast (even if is_active was False)
+            running_uids = db.get_all_running_broadcast_users()
+            for r_uid in running_uids:
+                sel_ids = db.get_selected_broadcast_accounts(r_uid)
+                if sel_ids:
+                    for a in db.get_user_accounts(r_uid):
+                        aid_s = str(a["_id"])
+                        if aid_s in sel_ids and aid_s not in keep_accounts_by_id:
+                            keep_accounts_by_id[aid_s] = a
+
+            current_active_ids = set(keep_accounts_by_id.keys())
 
             # 1. Clean up removed or deactivated accounts
             for aid in list(global_account_clients.keys()):
@@ -6205,9 +6343,8 @@ async def persistent_dm_forwarder_service():
                     await stop_and_remove_account_client(aid)
                     logger.info(f"24/7 DM Forwarder: Disconnected inactive account {aid}")
 
-            # 2. Ensure each active account is connected via unified pool
-            for acc in active_accounts:
-                acc_id_str = str(acc["_id"])
+            # 2. Ensure each active/selected account is connected via unified pool
+            for acc_id_str, acc in keep_accounts_by_id.items():
                 uid = acc.get("user_id")
                 await get_or_create_client(acc_id_str, acc, uid)
                 await asyncio.sleep(0.5)
@@ -6624,8 +6761,12 @@ async def auto_resume_active_broadcasts():
 
         logger.info(f"Auto-resuming active broadcast(s) for user(s): {running_uids}")
         for uid in running_uids:
+            uid = int(uid)
             if uid in user_tasks and not user_tasks[uid].done():
                 continue
+
+            # Clear any pending reload flag since startup is already loading fresh DB state
+            db.consume_broadcast_reload(uid)
 
             accounts = db.get_user_accounts(uid)
             if not accounts:
@@ -6637,10 +6778,10 @@ async def auto_resume_active_broadcasts():
             acc_ids = {str(a['_id']) for a in accounts}
             if selected and not any(sid in acc_ids for sid in selected):
                 logger.warning(f"Auto-resume: User {uid} selected accounts {selected} not in DB. Resetting to active accounts.")
-                selected = [str(accounts[0]['_id'])] if accounts else None
+                selected = _pick_fallback_selected(accounts)
                 db.set_selected_broadcast_accounts(uid, selected or [])
             logger.info(f"Auto-resuming broadcast for user {uid} (selected: {selected})...")
-            await _launch_broadcast(pyro, uid, account_ids=selected)
+            await _launch_broadcast(pyro, uid, account_ids=selected, require_running_in_db=True)
             await send_dm_log(
                 uid,
                 "<b>🔄 Server Reboot Auto-Recovery:</b>\n"
@@ -6648,6 +6789,90 @@ async def auto_resume_active_broadcasts():
             )
     except Exception as e:
         logger.error(f"Error in auto_resume_active_broadcasts: {e}")
+
+
+async def _reload_single_user_broadcast(uid, notify_dm=True, require_running_in_db=False):
+    """Hot-reload broadcast for a single user without affecting any other running users."""
+    uid = int(uid)
+    accounts = db.get_user_accounts(uid)
+    if not accounts:
+        db.set_broadcast_state(uid, running=False)
+        await cleanup_inactive_clients_for_user(uid)
+        logger.warning(f"Hot-reload: User {uid} has no accounts in DB. Stopped broadcast.")
+        return False, f"User {uid} has no accounts in DB."
+
+    selected = db.get_selected_broadcast_accounts(uid)
+    acc_ids = {str(a['_id']) for a in accounts}
+    if selected and not any(sid in acc_ids for sid in selected):
+        logger.warning(f"Hot-reload: User {uid} selected accounts {selected} not in DB. Resetting to active fallback.")
+        selected = _pick_fallback_selected(accounts)
+        db.set_selected_broadcast_accounts(uid, selected or [])
+
+    launched = await _launch_broadcast(
+        pyro,
+        uid,
+        account_ids=selected,
+        cleanup_inactive=True,
+        require_running_in_db=require_running_in_db,
+        is_hot_reload=True,
+    )
+    if launched and notify_dm:
+        await send_dm_log(
+            uid,
+            "<b>🔄 Account Hot-Reloaded:</b>\n"
+            "<i>Updated account(s) loaded seamlessly without restarting other broadcasts! ✅</i>"
+        )
+    logger.info(f"Hot-reloaded broadcast for user {uid} (launched={launched}, selected={selected})")
+    return launched, f"Hot-reloaded user {uid} (selected: {selected})"
+
+
+async def broadcast_hot_reload_watcher():
+    """
+    Lightweight per-user hot-reload & auto-recovery watcher (15s interval).
+    Picks up single-user DB account updates without restarting Railway or interrupting other users.
+    """
+    logger.info("Starting Per-User Hot-Reload Watcher Service (15s interval)...")
+    await asyncio.sleep(15)
+
+    while True:
+        try:
+            states = db.get_broadcast_states_snapshot()
+            for st in states:
+                if not st.get("running", False):
+                    continue
+                uid_raw = st.get("user_id")
+                if uid_raw is None:
+                    continue
+                uid = int(uid_raw)
+
+                if _get_user_launch_lock(uid).locked():
+                    continue
+
+                if st.get("reload_requested", False):
+                    if db.consume_broadcast_reload(uid):
+                        logger.info(f"Hot-reload watcher triggered for user {uid}")
+                        await _reload_single_user_broadcast(
+                            uid,
+                            notify_dm=True,
+                            require_running_in_db=True,
+                        )
+                    continue
+
+                active_task = user_tasks.get(uid)
+                if active_task is None or active_task.done():
+                    logger.info(f"Hot-reload watcher starting unstarted running=True user {uid}")
+                    await _reload_single_user_broadcast(
+                        uid,
+                        notify_dm=False,
+                        require_running_in_db=True,
+                    )
+        except asyncio.CancelledError:
+            logger.info("Per-User Hot-Reload Watcher stopped.")
+            break
+        except Exception as e:
+            logger.warning(f"Error in broadcast_hot_reload_watcher: {e}")
+
+        await asyncio.sleep(15)
 
 
 async def periodic_memory_cleanup_daemon():
@@ -6735,6 +6960,9 @@ async def main():
     # Launch 24/7 Persistent Background DM Forwarder Service
     dm_forwarder_task = asyncio.create_task(persistent_dm_forwarder_service())
 
+    # Launch Per-User Hot-Reload Watcher Service
+    hot_reload_task = asyncio.create_task(broadcast_hot_reload_watcher())
+
     # Auto-resume broadcasts that were running before server reboot
     asyncio.create_task(auto_resume_active_broadcasts())
 
@@ -6745,6 +6973,9 @@ async def main():
     finally:
         for uid, task in list(user_tasks.items()):
             try: task.cancel()
+            except Exception: pass
+        if not hot_reload_task.done():
+            try: hot_reload_task.cancel()
             except Exception: pass
         if not dm_forwarder_task.done():
             try: dm_forwarder_task.cancel()

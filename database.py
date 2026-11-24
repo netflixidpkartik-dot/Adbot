@@ -636,15 +636,62 @@ class EnhancedDatabaseManager:
     def set_broadcast_state(self, user_id, running=False, paused=False):
         """Set user's broadcast state."""
         try:
+            update_fields = {"running": running, "paused": paused, "updated_at": datetime.now()}
+            if not running:
+                update_fields["reload_requested"] = False
             self.db.broadcast_states.update_one(
                 {"user_id": user_id},
-                {"$set": {"running": running, "paused": paused, "updated_at": datetime.now()}},
+                {"$set": update_fields},
                 upsert=True
             )
             logger.info(f"Broadcast state updated for {user_id}: running={running}, paused={paused}")
         except Exception as e:
             logger.error(f"Failed to set broadcast state for {user_id}: {e}")
             raise
+
+    def request_broadcast_reload(self, user_id, running=True):
+        """Request a per-user hot-reload without restarting other running broadcasts."""
+        try:
+            self.db.broadcast_states.update_one(
+                {"user_id": user_id},
+                {"$set": {
+                    "running": running,
+                    "paused": False,
+                    "reload_requested": True,
+                    "reload_requested_at": datetime.now(),
+                    "updated_at": datetime.now()
+                }},
+                upsert=True
+            )
+            logger.info(f"Hot-reload requested for user {user_id} (running={running})")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to request broadcast reload for {user_id}: {e}")
+            return False
+
+    def consume_broadcast_reload(self, user_id):
+        """Atomically consume a pending reload_requested flag for a running user."""
+        try:
+            doc = self.db.broadcast_states.find_one_and_update(
+                {"user_id": user_id, "running": True, "reload_requested": True},
+                {"$set": {"reload_requested": False, "updated_at": datetime.now()}}
+            )
+            return doc is not None
+        except Exception as e:
+            logger.error(f"Failed to consume broadcast reload for {user_id}: {e}")
+            return False
+
+    def get_broadcast_states_snapshot(self):
+        """Return lightweight broadcast state docs for all users."""
+        try:
+            docs = self.db.broadcast_states.find(
+                {},
+                {"user_id": 1, "running": 1, "paused": 1, "reload_requested": 1}
+            )
+            return list(docs)
+        except Exception as e:
+            logger.error(f"Failed to get broadcast states snapshot: {e}")
+            return []
 
     def increment_broadcast_cycle(self, user_id):
         """Increment the broadcast cycle count for a user."""
