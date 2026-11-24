@@ -299,8 +299,18 @@ def kb(rows):
     return InlineKeyboardMarkup(rows)
 
 # Initialize Pyrogram clients
-pyro = PyroClient("adbot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
-logger_client = PyroClient("logger_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.LOGGER_BOT_TOKEN)
+adbot_session_str = os.environ.get("ADBOT_SESSION_STRING")
+logger_session_str = os.environ.get("LOGGER_BOT_SESSION_STRING")
+
+if adbot_session_str:
+    pyro = PyroClient("adbot", api_id=config.API_ID, api_hash=config.API_HASH, session_string=adbot_session_str)
+else:
+    pyro = PyroClient("adbot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
+
+if logger_session_str:
+    logger_client = PyroClient("logger_bot", api_id=config.API_ID, api_hash=config.API_HASH, session_string=logger_session_str)
+else:
+    logger_client = PyroClient("logger_bot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.LOGGER_BOT_TOKEN)
 
 # In-memory storage for broadcast tasks
 user_tasks = {}
