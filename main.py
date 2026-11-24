@@ -1602,6 +1602,9 @@ async def run_broadcast(client, uid, account_ids=None):
         # Filter to selected accounts if specified
         if account_ids:
             accounts = [a for a in all_accounts if str(a['_id']) in account_ids]
+            if not accounts:
+                logger.warning(f"User {uid}: None of selected accounts {account_ids} exist in DB. Falling back to all accounts.")
+                accounts = all_accounts
         else:
             accounts = all_accounts
 
@@ -6631,6 +6634,11 @@ async def auto_resume_active_broadcasts():
                 continue
 
             selected = db.get_selected_broadcast_accounts(uid)
+            acc_ids = {str(a['_id']) for a in accounts}
+            if selected and not any(sid in acc_ids for sid in selected):
+                logger.warning(f"Auto-resume: User {uid} selected accounts {selected} not in DB. Resetting to active accounts.")
+                selected = [str(accounts[0]['_id'])] if accounts else None
+                db.set_selected_broadcast_accounts(uid, selected or [])
             logger.info(f"Auto-resuming broadcast for user {uid} (selected: {selected})...")
             await _launch_broadcast(pyro, uid, account_ids=selected)
             await send_dm_log(
